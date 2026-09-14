@@ -507,19 +507,16 @@ __device__ __forceinline__ void mma_m16n8k16_f16_emu
 // emulated mma_m16n8k16. One WMMA covers a 16x16 output tile, replacing TWO
 // 16x8 PTX MMA calls.
 //
-// The WMMA register layout differs from PTX mma.m16n8k16:
-//   WMMA A (K-major, 16x16): lane l holds A[l%16][(l/16)*8 .. (l/16)*8+7]
-//   WMMA B (K-major, 16x16): lane l holds B[l%16][(l/16)*8 .. (l/16)*8+7]
-//   WMMA C (M-major, 16x16): lane l holds D[l%16][(l/16)*8 .. (l/16)*8+7]
-//
-// On gfx11, A and B require replication: 8 unique half values duplicated to 16.
+// WMMA register layout (verified against AMD matrix_calculator.py):
+//   A: lane l holds A[l%16][0..15] (full row, 8 half2). Lanes l and l+16 identical.
+//   B: lane l holds B[0..15][l%16] (full column, 8 half2). Lanes l and l+16 identical.
+//   D: lane l holds D[2r + l/16][l%16] for r=0..7 (8 float).
+//      Lanes 0-15: even rows (0,2,...,14). Lanes 16-31: odd rows (1,3,...,15).
 //
 // PTX layout (for reference):
 //   A: lane l=(g,t)=(l/4,l%4); a[j] holds A[g+8*(j%2)][2t+8*(j/2)..+1]
-//   B: lane l; b[i] holds B[2t+8*i][g] and B[2t+8*i+1][g]
-//   C: lane l; c[i] holds D[g+8*(i/2)][2t+(i%2)]
-//
-// The conversion uses register shuffles — cheap compared to the FMA ops replaced.
+//   B: lane l=(g,t)=(l/4,l%4); b[i] holds B[2t+8*i][g] and B[2t+8*i+1][g]
+//   C: lane l=(g,t); c[i] holds D[g+8*(i/2)][2t+(i%2)]
 // ============================================================================
 
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
@@ -528,94 +525,109 @@ using WmmaA16 = _Float16 __attribute__((ext_vector_type(16)));
 using WmmaB16 = _Float16 __attribute__((ext_vector_type(16)));
 using WmmaC32 = float __attribute__((ext_vector_type(8)));
 
-// Convert PTX FragA (8 half, 16x16 K=16 tile) to WMMA A layout.
-// 4 half2 shuffles + 4 half2 copies for replication.
+// Convert PTX FragA to WMMA A layout.
+// WMMA lane l needs A[l%16][0..15] (full row). 8 half2 shuffles, no replication.
+// PTX lane (g,t) with g=l/4, t=l%4 holds:
+//   a[0]=A[g][2t,2t+1], a[1]=A[g+8][2t,2t+1],
+//   a[2]=A[g][2t+8,2t+9], a[3]=A[g+8][2t+8,2t+9]
+// For WMMA row r, k=2j..2j+1:
+//   j<4 (k<8):  source = a[r<8?0:1] from lane (r%8)*4 + j
+//   j>=4 (k>=8): source = a[r<8?2:3] from lane (r%8)*4 + (j-4)
 __device__ __forceinline__ WmmaA16 ptx_to_wmma_a(const FragA& frag_a)
 {
     int lane = threadIdx.x & 31;
     int row = lane % 16;
-    int col_group = lane / 16;
-    int g = row % 8;
-    int elem = col_group * 2 + (row >= 8 ? 1 : 0);
 
     const half2* a = reinterpret_cast<const half2*>(&frag_a);
     WmmaA16 result;
     half2* r = reinterpret_cast<half2*>(&result);
 
-    // Must shuffle a specific VGPR (a[0..3]) from the source lane, not the source
-    // lane's a[elem] which may differ. Switch ensures compile-time constant VGPR.
-    #define SHFL_A(dst, src, e) \
+    // elem = (row>=8?1:0) + (j>=4?2:0) → {0,1,2,3}
+    // Switch ensures compile-time constant VGPR for __shfl_sync.
+    #define SHFL_A(dst, src_lane, e) \
         switch (e) { \
-            case 0: dst = shfl_h2(a[0], src); break; \
-            case 1: dst = shfl_h2(a[1], src); break; \
-            case 2: dst = shfl_h2(a[2], src); break; \
-            case 3: dst = shfl_h2(a[3], src); break; \
+            case 0: dst = shfl_h2(a[0], src_lane); break; \
+            case 1: dst = shfl_h2(a[1], src_lane); break; \
+            case 2: dst = shfl_h2(a[2], src_lane); break; \
+            case 3: dst = shfl_h2(a[3], src_lane); break; \
         }
 
-    SHFL_A(r[0], g * 4 + 0, elem)
-    SHFL_A(r[1], g * 4 + 1, elem)
-    SHFL_A(r[2], g * 4 + 2, elem)
-    SHFL_A(r[3], g * 4 + 3, elem)
+    int base = (row % 8) * 4;
+    int e_lo = (row >= 8) ? 1 : 0;  // a[0] or a[1] for k<8
+    int e_hi = (row >= 8) ? 3 : 2;  // a[2] or a[3] for k>=8
+
+    SHFL_A(r[0], base + 0, e_lo)
+    SHFL_A(r[1], base + 1, e_lo)
+    SHFL_A(r[2], base + 2, e_lo)
+    SHFL_A(r[3], base + 3, e_lo)
+    SHFL_A(r[4], base + 0, e_hi)
+    SHFL_A(r[5], base + 1, e_hi)
+    SHFL_A(r[6], base + 2, e_hi)
+    SHFL_A(r[7], base + 3, e_hi)
     #undef SHFL_A
 
-    // Replicate for gfx11 (2x for wave32)
-    r[4] = r[0]; r[5] = r[1]; r[6] = r[2]; r[7] = r[3];
     return result;
 }
 
 // Convert two adjacent PTX FragB (each 16x8, together 16x16) to WMMA B layout.
-// PTX B is N-major (each lane holds 1 column, 4 rows); WMMA B is K-major (each lane
-// holds 1 row, 8 columns). This transpose requires 16 shuffles + 16 selects.
-// Still far cheaper than the 128-256 scalar FMA ops in the emulated MMA.
+// WMMA lane l needs B[0..15][l%16] (full column). 16 half2 shuffles + 8 selects.
+// PTX lane (g,t) with g=l/4, t=l%4 holds:
+//   b[0]=B[2t][g], B[2t+1][g]; b[1]=B[2t+8][g], B[2t+9][g]
+// For WMMA column c, k=2j..2j+1:
+//   j<4 (k<8):  shuffle b[0] from lane (c%8)*4 + j → gives B[2j][c], B[2j+1][c]
+//   j>=4 (k>=8): shuffle b[1] from lane (c%8)*4 + (j-4)
+// If c<8, source from frag_b0; if c>=8, source from frag_b1.
+// Must shuffle from BOTH frag_b0 and frag_b1 since the source lane's own col
+// may differ from the calling lane's col (source lane's b0/b1 selection differs).
 __device__ __forceinline__ WmmaB16 ptx_to_wmma_b(const FragB& frag_b0, const FragB& frag_b1)
 {
     int lane = threadIdx.x & 31;
-    int row = lane % 16;       // k index
-    int col_group = lane / 16;  // 0 → cols 0-7 (frag_b0), 1 → cols 8-15 (frag_b1)
+    int col = lane % 16;
 
     const half2* b0 = reinterpret_cast<const half2*>(&frag_b0);
     const half2* b1 = reinterpret_cast<const half2*>(&frag_b1);
 
-    int k = row;
-    int half_k = (k < 8) ? (k / 2) : ((k - 8) / 2);
-    int b_elem = (k < 8) ? 0 : 1;
-    bool take_low = (k % 2 == 0);
-
     WmmaB16 result;
-    half* r = reinterpret_cast<half*>(&result);
+    half2* r = reinterpret_cast<half2*>(&result);
 
-    // Must shuffle specific VGPRs (b[0] or b[1]) from the source lane, not the
-    // source lane's b[b_elem] which may differ. Switch ensures correct VGPR.
-    // Also must shuffle from both frag_b0 and frag_b1 since source lanes span
-    // both col_groups.
-    #define SHFL_B(dst, bptr, src, be) \
+    // Switch ensures compile-time constant VGPR for __shfl_sync.
+    #define SHFL_B0(dst, src, be) \
         switch (be) { \
-            case 0: dst = shfl_h2(bptr[0], src); break; \
-            case 1: dst = shfl_h2(bptr[1], src); break; \
+            case 0: dst = shfl_h2(b0[0], src); break; \
+            case 1: dst = shfl_h2(b0[1], src); break; \
+        }
+    #define SHFL_B1(dst, src, be) \
+        switch (be) { \
+            case 0: dst = shfl_h2(b1[0], src); break; \
+            case 1: dst = shfl_h2(b1[1], src); break; \
         }
 
-    #pragma unroll
-    for (int n = 0; n < 8; ++n)
-    {
-        half2 v0, v1;
-        SHFL_B(v0, b0, n * 4 + half_k, b_elem)
-        SHFL_B(v1, b1, n * 4 + half_k, b_elem)
-        half2 v = (col_group == 0) ? v0 : v1;
-        r[n] = take_low ? __low2half(v) : __high2half(v);
-    }
-    #undef SHFL_B
+    int base = (col % 8) * 4;
 
-    // Replicate for gfx11 (2x for wave32)
+    // j=0..3: k<8, b_elem=0. j=4..7: k>=8, b_elem=1.
     #pragma unroll
-    for (int n = 0; n < 8; ++n)
-        r[8 + n] = r[n];
+    for (int j = 0; j < 8; ++j)
+    {
+        int be = j < 4 ? 0 : 1;
+        int src = base + (j % 4);
+        half2 v0, v1;
+        SHFL_B0(v0, src, be)
+        SHFL_B1(v1, src, be)
+        r[j] = (col < 8) ? v0 : v1;
+    }
+    #undef SHFL_B0
+    #undef SHFL_B1
+
     return result;
 }
 
-
-// Convert WMMA C (8 float, 16x16 M-major) back to two PTX FragC (each 4 float, 16x8).
-// 8 float shuffles total (4 per FragC). Uses switch to ensure compile-time constant
-// VGPR selection for __shfl_sync — runtime indexing would read the wrong VGPR.
+// Convert WMMA C (8 float, column-major) back to two PTX FragC (each 4 float, 16x8).
+// WMMA D: lane l holds D[2r + l/16][l%16] for r=0..7.
+//   Lanes 0-15: even rows (0,2,...,14). Lanes 16-31: odd rows (1,3,...,15).
+// PTX C: lane (g,t); c[i] holds D[g+8*(i/2)][2t+(i%2)]
+//   d0[0]=D[g][2t], d0[1]=D[g][2t+1], d0[2]=D[g+8][2t], d0[3]=D[g+8][2t+1]
+//   d1[0]=D[g][2t+8], d1[1]=D[g][2t+9], d1[2]=D[g+8][2t+8], d1[3]=D[g+8][2t+9]
+// D[i][j] is at WMMA lane (i%2)*16 + j, register i/2.
 __device__ __forceinline__ void wmma_to_ptx_c(const WmmaC32& wmma_c, FragC& frag_c0, FragC& frag_c1)
 {
     int lane = threadIdx.x & 31;
@@ -625,16 +637,18 @@ __device__ __forceinline__ void wmma_to_ptx_c(const WmmaC32& wmma_c, FragC& frag
     float* d0 = reinterpret_cast<float*>(&frag_c0);
     float* d1 = reinterpret_cast<float*>(&frag_c1);
 
-    // PTX C1 (cols 0-7): d0 = {D[g][2t], D[g][2t+1], D[g+8][2t], D[g+8][2t+1]}
-    // WMMA C: lane l holds D[l%16][(l/16)*8 + 0..7]
-    //   col_group 0 (l<16): D[l][0..7]    → source lanes g and g+8
-    //   col_group 1 (l≥16): D[l-16][8..15] → source lanes g+16 and g+24
+    // D[i][j] at WMMA lane (i%2)*16 + j, register i/2.
+    // d0[0] = D[g][2t]:     WMMA lane (g%2)*16 + 2t,   reg g/2
+    // d0[1] = D[g][2t+1]:   WMMA lane (g%2)*16 + 2t+1, reg g/2
+    // d0[2] = D[g+8][2t]:   WMMA lane (g%2)*16 + 2t,   reg g/2 + 4
+    // d0[3] = D[g+8][2t+1]: WMMA lane (g%2)*16 + 2t+1, reg g/2 + 4
+    // d1[0..3] same with +8 lane offset (columns 8-15)
 
-    int e0 = 2 * t;     // even column index within the 8-element row
-    int e1 = 2 * t + 1; // odd column index
+    int e0 = g / 2;       // register for row g
+    int e1 = g / 2 + 4;   // register for row g+8
+    int lane_base = (g % 2) * 16;
 
-    // Shuffle float at element e0/e1 from the appropriate WMMA lane
-    // Switch ensures the compiler selects the correct VGPR for __shfl_sync
+    // Switch ensures compile-time constant VGPR for __shfl_sync.
     #define WMMA_SHFL(dst, src, e) \
         switch (e) { \
             case 0: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[0], src); break; \
@@ -647,17 +661,17 @@ __device__ __forceinline__ void wmma_to_ptx_c(const WmmaC32& wmma_c, FragC& frag
             case 7: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[7], src); break; \
         }
 
-    // FragC0: columns 0-7 (WMMA col_group 0, lanes 0-15)
-    WMMA_SHFL(d0[0], g, e0)
-    WMMA_SHFL(d0[1], g, e1)
-    WMMA_SHFL(d0[2], g + 8, e0)
-    WMMA_SHFL(d0[3], g + 8, e1)
+    // FragC0: columns 0-7
+    WMMA_SHFL(d0[0], lane_base + 2 * t,     e0)
+    WMMA_SHFL(d0[1], lane_base + 2 * t + 1, e0)
+    WMMA_SHFL(d0[2], lane_base + 2 * t,     e1)
+    WMMA_SHFL(d0[3], lane_base + 2 * t + 1, e1)
 
-    // FragC1: columns 8-15 (WMMA col_group 1, lanes 16-31)
-    WMMA_SHFL(d1[0], g + 16, e0)
-    WMMA_SHFL(d1[1], g + 16, e1)
-    WMMA_SHFL(d1[2], g + 24, e0)
-    WMMA_SHFL(d1[3], g + 24, e1)
+    // FragC1: columns 8-15
+    WMMA_SHFL(d1[0], lane_base + 2 * t + 8, e0)
+    WMMA_SHFL(d1[1], lane_base + 2 * t + 9, e0)
+    WMMA_SHFL(d1[2], lane_base + 2 * t + 8, e1)
+    WMMA_SHFL(d1[3], lane_base + 2 * t + 9, e1)
 
     #undef WMMA_SHFL
 }
