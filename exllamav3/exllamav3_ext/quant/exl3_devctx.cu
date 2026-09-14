@@ -36,11 +36,23 @@ int DevCtx::get_cc(int device)
     {
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
+#if defined(USE_ROCM)
+        // The kernels assume 32-lane warps throughout (warp masks, ballot widths, MMA
+        // fragment layouts). RDNA parts run wave32 by default; CDNA runs wave64 and is
+        // not supported.
+        TORCH_CHECK(prop.warpSize == 32,
+                    "exllamav3: ROCm device ", prop.name, " has warpSize ", prop.warpSize,
+                    "; only wave32 (RDNA) targets are supported");
+        // gfx capability numbers do not map to NVIDIA SM classes; the Ada selection
+        // heuristics are the closest fit for RDNA's per-CU resources.
+        cc[device] = CC_ADA;
+#else
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
         else if (prop.major >= 9) cc[device] = CC_HOPPER;
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
         else if (prop.major >= 8) cc[device] = CC_AMPERE;
         else cc[device] = CC_OLD;
+#endif
     }
     return cc[device];
 }

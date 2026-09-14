@@ -4,7 +4,14 @@
 
 // Constants
 #define EXL3_GEMM_BASE_THREADS 256
+#if defined(USE_ROCM)
+// 64 KB is the dynamic shared memory opt-in limit on both RDNA (gfx10/11/12) and CDNA
+// (gfx9) parts. Kernel configurations whose footprint exceeds it are not instantiated
+// on ROCm (see exl3_kernel_map.cuh).
+#define SMEM_MAX (64 * 1024)
+#else
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
+#endif
 
 #include "exl3_dq.cuh"
 
@@ -18,6 +25,33 @@
 #else
     #define EXL3_GEMM_H_ACC 0
 #endif
+
+// Dynamic shared memory footprint of one kernel configuration, in bytes. Host-callable so
+// the instance tables and shape selection can reject configurations that exceed SMEM_MAX
+// (matters on ROCm, where the opt-in limit is 64 KB).
+constexpr int exl3_gemm_smem_bytes
+(
+    int bits,
+    int TILESIZE_M,
+    int TILESIZE_K,
+    int TILESIZE_N,
+    int SH_STAGES,
+    bool shmem_out_had
+)
+{
+    const int TILEBLOCKS_K = TILESIZE_K / 16;
+    const int TILEBLOCKS_N = TILESIZE_N / 16;
+    const int TILEBLOCKS_M = TILESIZE_M / 16;
+    const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
+    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                          // in halfs
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;    // in uint16s
+    const int sh_c_size = MAX  // in floats
+    (
+        4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
+        shmem_out_had ? TILESIZE_N * TILESIZE_M : 0
+    );
+    return SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+}
 
 // TILESIZE_M == 16 is the dense / decode shape: one m16 row fragment, A fragments double-buffered
 // across the fragment stages (codegen unchanged by the multi-row support below). TILESIZE_M > 16
@@ -70,7 +104,7 @@ void exl3_gemm_kernel_inner
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
     (
-        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        SMEM_MAX >= exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, shmem_out_had),
         "Invalid kernel params (insufficient shared memory for shape)"
     );
 
@@ -213,11 +247,11 @@ void exl3_gemm_kernel_inner
     // TILEBLOCKS_M == 1 (dense / decode): A fragments double-buffered across the fragment stages,
     // as before. TILEBLOCKS_M > 1 (fused MoE prefill tiles): one A fragment per 16-row block,
     // single-buffered, so the row fragments fit alongside the prefetched B fragments
-    register FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
-    register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+    FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
+    FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
+    FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+        FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()

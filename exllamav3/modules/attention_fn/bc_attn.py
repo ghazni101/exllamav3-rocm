@@ -84,7 +84,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # CUDA emits a cubin; the ROCm backend emits an hsaco
+            image = ck.asm["hsaco" if torch.version.hip else "cubin"]
+            k = ext.TritonKernel(image, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 

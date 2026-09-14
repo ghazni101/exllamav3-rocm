@@ -60,24 +60,28 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
 #define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
+#define EXL3_GEMM_SH_STAGES   0,  6,  4,  4,  4
 #define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
 
 #define EXL3_GEMM_NUM_SHAPES 4
 
-// Shape 1 not currently used anywhere
+// Shape 1 not currently used anywhere. The *_or_null helpers yield nullptr for
+// configurations that do not fit SMEM_MAX (on ROCm: shape 4 at bits = 8), so the
+// oversized instantiation is never compiled and the table entry is skipped by the
+// nullptr checks in the launchers.
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_gemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>(), \
+    exl3_gemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>(), \
+    exl3_gemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>(), \
+    exl3_gemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>()
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_mgemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>(), \
+    exl3_mgemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>(), \
+    exl3_mgemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>(), \
+    exl3_mgemm_kernel_or_null<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>()
 
 #define EXL3_GEMM_BASE_THREADS 256
 

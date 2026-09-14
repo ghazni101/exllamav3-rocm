@@ -341,3 +341,26 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         }
     }
 }
+
+// Instance-table helpers: return the kernel pointer, or nullptr when the configuration's
+// shared memory footprint exceeds SMEM_MAX. On ROCm (64 KB opt-in limit) this excludes the
+// 16x16x512 shape at bits = 8; on CUDA every shape fits. The discarded branch of
+// if constexpr is not instantiated, so oversized configurations never reach the
+// static_assert in exl3_gemm_kernel_inner.
+template<EXL3_GEMM_T_ARGS>
+inline fp_exl3_gemm_kernel exl3_gemm_kernel_or_null()
+{
+    if constexpr (exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, true) <= SMEM_MAX)
+        return &exl3_gemm_kernel<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>;
+    else
+        return nullptr;
+}
+
+template<EXL3_GEMM_T_ARGS>
+inline fp_exl3_mgemm_kernel exl3_mgemm_kernel_or_null()
+{
+    if constexpr (exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, false) <= SMEM_MAX)
+        return &exl3_mgemm_kernel<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>;
+    else
+        return nullptr;
+}

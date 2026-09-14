@@ -62,6 +62,34 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
 // writing satisfying values into the flags.
 namespace {
 
+#if defined(USE_ROCM)
+typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, uint32_t, unsigned int, uint32_t);
+typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, uint32_t, unsigned int);
+
+
+struct MemOps
+{
+    fn_stream_wait32 wait = nullptr;
+    fn_stream_write32 write = nullptr;
+    bool resolved = false;
+    MemOps()
+    {
+#ifdef __linux__
+        void* h = dlopen("libamdhip64.so.7", RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) h = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) return;
+        wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
+        write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
+#else
+        HMODULE h = GetModuleHandleA("amdhip64.dll");
+        if (!h) return;
+        wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
+        write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
+#endif
+        resolved = wait && write;
+    }
+};
+#else
 typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 
@@ -93,6 +121,7 @@ struct MemOps
         resolved = wait && write;
     }
 };
+#endif
 
 MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
@@ -112,12 +141,18 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
+#if defined(USE_ROCM)
+        hipError_t r = m.write((hipStream_t) stream, (void*) flag, (uint32_t) value, 0);
+        if (r == hipSuccess) return;
+#else
         CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<uint32_t*>(flag), static_cast<uint32_t>(value));
 }
+
 
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
 {
@@ -126,6 +161,16 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
+#if defined(USE_ROCM)
+        hipError_t r = m.wait(
+            (hipStream_t) stream,
+            (void*) flag,
+            (uint32_t) value,
+            hipStreamWaitValueGte,
+            0xFFFFFFFFu
+        );
+        if (r == hipSuccess) return;
+#else
         CUresult r = m.wait(
             (CUstream) stream,
             (CUdeviceptr) flag,
@@ -133,6 +178,7 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
             CU_STREAM_WAIT_VALUE_GEQ
         );
         if (r == CUDA_SUCCESS) return;
+#endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>

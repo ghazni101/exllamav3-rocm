@@ -1818,7 +1818,7 @@ def paged_attn_triton_prefill(
 
     # Tile configs by head_dim, sized for ~100 KB of smem with two pipeline stages. Blackwell
     # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
-    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
+    blackwell = torch.version.hip is None and torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
         cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
     elif hd_pad <= 256:

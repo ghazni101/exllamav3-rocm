@@ -10,6 +10,8 @@ namespace cg = cooperative_groups;
 #include <mutex>
 #include <map>
 #include "exl3_kernel_map.cuh"
+#include "hadamard_inner.cuh"
+#include "exl3_gemm_inner.cuh"
 #include "exl3_devctx.cuh"
 #include "comp_units/exl3_comp_unit_1.cuh"
 #include "comp_units/exl3_comp_unit_2.cuh"
@@ -19,6 +21,27 @@ namespace cg = cooperative_groups;
 #include "comp_units/exl3_comp_unit_6.cuh"
 #include "comp_units/exl3_comp_unit_7.cuh"
 #include "comp_units/exl3_comp_unit_8.cuh"
+
+int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
+int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
+int exl3_gemm_sh_stages[] = {EXL3_GEMM_SH_STAGES};
+int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
+
+// Whether a kernel shape's shared memory footprint fits the launch budget (SMEM_MAX).
+// On ROCm this rejects shape 4 at bits = 8 (66 KB > 64 KB opt-in limit); on CUDA every
+// shape fits. TILESIZE_M is 16 for all shapes; the shmem_out_had variant is the larger
+// of the two footprints.
+static bool exl3_gemm_shape_smem_ok(int shape_idx, int K)
+{
+    return exl3_gemm_smem_bytes
+    (
+        K, 16,
+        exl3_gemm_tilesize_k[shape_idx],
+        exl3_gemm_tilesize_n[shape_idx],
+        exl3_gemm_sh_stages[shape_idx],
+        true
+    ) <= SMEM_MAX;
+}
 
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out)
 {
@@ -38,7 +61,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
                 return 3;
             }
             if (mod_256 && size_n < 4096) return size_k > 8192 ? 3 : 2;
-            if (mod_512 && (size_n * size_k) > (4096 * 4096) && K <= 6) return 4;
+            if (mod_512 && (size_n * size_k) > (4096 * 4096) && K <= 6 && exl3_gemm_shape_smem_ok(4, K)) return 4;
             if (mod_256) return 3;
             return 2;
 
@@ -50,7 +73,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
                 return 3;
             }
             if (size_n <= 16384) return 2;
-            if (mod_512 && size_n >= 32768) return 4;
+            if (mod_512 && size_n >= 32768 && exl3_gemm_shape_smem_ok(4, K)) return 4;
             if (mod_256) return 3;
             return 2;
 
@@ -63,11 +86,11 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
             if (K >= 7)
             {
                 if (mod_256 && size_n <= 8192) return size_k > 32768 ? 3 : 2;
-                if (mod_512 && size_n > 32768) return 4;
+                if (mod_512 && size_n > 32768 && exl3_gemm_shape_smem_ok(4, K)) return 4;
                 return 2;
             }
             if (mod_256 && size_n <= 4096) return size_k > 8192 && K >= 3 ? 3 : 2;
-            if (mod_512 && size_n > 16384) return 4;
+            if (mod_512 && size_n > 16384 && exl3_gemm_shape_smem_ok(4, K)) return 4;
             if (mod_256) return 3;
             return 2;
     }
@@ -79,15 +102,11 @@ int exl3_gemm_num_kernel_shapes()
     return EXL3_GEMM_NUM_SHAPES;
 }
 
-int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
-int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
-int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
-
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K)
 {
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-    return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0);
+    return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0) && exl3_gemm_shape_smem_ok(shape_idx, K);
 }
 
 // Instance tables, [K][cb] -> array indexed by shape_idx. Row 0 unused (no K = 0 instances)
@@ -160,7 +179,10 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     }
 
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
-    return (c_fp32 ? tab_gemm_fp32 : tab_gemm_fp16)[K][cb][shape_idx];
+    fp_exl3_gemm_kernel kernel = (c_fp32 ? tab_gemm_fp32 : tab_gemm_fp16)[K][cb][shape_idx];
+    TORCH_CHECK(kernel != nullptr, "exl3_gemm: shape ", shape_idx, " at bits = ", K,
+                " exceeds the shared memory limit on this platform");
+    return kernel;
 }
 
 fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
@@ -195,7 +217,10 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     }
 
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
-    return (c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16)[K][cb][shape_idx];
+    fp_exl3_mgemm_kernel kernel = (c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16)[K][cb][shape_idx];
+    TORCH_CHECK(kernel != nullptr, "exl3_mgemm: shape ", shape_idx, " at bits = ", K,
+                " exceeds the shared memory limit on this platform");
+    return kernel;
 }
 
 

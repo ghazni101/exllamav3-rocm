@@ -19,11 +19,18 @@ if precompile and not torch:
 windows = os.name == "nt"
 
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+is_hip = bool(torch and torch_version.hip)
+if is_hip:
+    # hipcc is clang-based; nvcc-only flags (-Xcudafe, --use_fast_math, -lineinfo) are not
+    # accepted. -ffast-math is the closest equivalent of --use_fast_math. gfx10/gfx11
+    # targets execute in wave32 by default, matching the 32-lane assumptions in the kernels.
+    extra_cuda_cflags = ["-O3", "-ffast-math", "-DHIPBLAS_USE_HIP_HALF"]
+else:
+    extra_cuda_cflags = [
+        "-lineinfo", "-O3", "--use_fast_math",
+        "-Xcudafe", "--diag_suppress=177",
+        "-Xcudafe", "--diag_suppress=20012",
+    ]
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
@@ -43,11 +50,8 @@ else:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
         extra_cuda_cflags += []
 
-if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
+if not is_hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
     extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
-
-if torch and torch_version.hip:
-    extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
 extra_compile_args = {
     "cxx": extra_cflags,
@@ -70,7 +74,12 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
-                libraries=["cublas"] if windows else [],
+                include_dirs=[sources_dir],
+                libraries=(
+                    ["hipblas"] if is_hip else
+                    ["cublas"] if windows else
+                    []
+                ),
             )
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},

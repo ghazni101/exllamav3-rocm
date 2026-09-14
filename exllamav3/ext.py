@@ -88,11 +88,19 @@ else:
     # compiler flags
 
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    is_hip = torch.version.hip is not None
+    if is_hip:
+        # hipcc is clang-based; nvcc-only flags (-Xcudafe, --use_fast_math, -lineinfo,
+        # --ptxas-options) are not accepted. -ffast-math is the closest equivalent of
+        # --use_fast_math. gfx10/gfx11 targets execute in wave32 by default, matching the
+        # 32-lane assumptions throughout the kernels.
+        extra_cuda_cflags = ["-O3", "-ffast-math", "-DHIPBLAS_USE_HIP_HALF"]
+    else:
+        extra_cuda_cflags = [
+            "-lineinfo", "-O3", "--use_fast_math",
+            "-Xcudafe", "--diag_suppress=177",
+            "-Xcudafe", "--diag_suppress=20012",
+        ]
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -112,23 +120,23 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
-    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    if not windows and not is_hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
-    if torch.version.hip:
-        extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
-
     if verbose:
-        extra_cuda_cflags += ["--ptxas-options=-v"]
+        extra_cuda_cflags += ["-v" if is_hip else "--ptxas-options=-v"]
 
     # linker flags
 
     extra_ldflags = []
 
     if windows:
-        extra_ldflags += ["cublas.lib"]
+        extra_ldflags += ["hipblas.lib" if is_hip else "cublas.lib"]
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
+    elif is_hip:
+        # The extension calls hipBLAS directly (hgemm.cu, graph.cu); link it explicitly
+        extra_ldflags += ["-lhipblas"]
 
     # sources
 
@@ -139,15 +147,33 @@ else:
         for root, _, files in os.walk(sources_dir)
         for file in files
         if file.endswith(('.c', '.cpp', '.cu'))
+        # Skip hipify outputs left over from a previous build: torch's hipify marks
+        # them already-translated (hipified_path = None), which crashes the ninja
+        # writer, and they must not be compiled as sources anyway.
+        and '_hip.' not in file and not file.startswith('hip_')
     ]
 
-    # Load extension
+    extra_include_paths = [sources_dir]
+    if is_hip:
+        # The pip ROCm SDK ships runtime headers only; torch's c10 headers pull in
+        # thrust/complex.h, which lives in a full ROCm install. Add it when present.
+        for rocm_root in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("ROCM_HOME"),
+            "/opt/rocm",
+        ):
+            if not rocm_root:
+                continue
+            inc = os.path.join(rocm_root, "include")
+            if os.path.exists(os.path.join(inc, "thrust", "complex.h")):
+                extra_include_paths.append(inc)
+                break
 
     maybe_set_arch_list_env()
     exllamav3_ext = load(
         name = extension_name,
         sources = sources,
-        extra_include_paths = [sources_dir],
+        extra_include_paths = extra_include_paths,
         verbose = verbose,
         extra_ldflags = extra_ldflags,
         extra_cuda_cflags = extra_cuda_cflags,
