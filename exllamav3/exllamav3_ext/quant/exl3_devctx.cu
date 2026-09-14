@@ -1,3 +1,4 @@
+#include <string>
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -43,9 +44,13 @@ int DevCtx::get_cc(int device)
         TORCH_CHECK(prop.warpSize == 32,
                     "exllamav3: ROCm device ", prop.name, " has warpSize ", prop.warpSize,
                     "; only wave32 (RDNA) targets are supported");
-        // gfx capability numbers do not map to NVIDIA SM classes; the Ada selection
-        // heuristics are the closest fit for RDNA's per-CU resources.
-        cc[device] = CC_ADA;
+        // Detect RDNA3 (gfx1100 series) for WMMA hardware acceleration and
+        // architecture-specific kernel shape tuning.
+        std::string gcn = prop.gcnArchName;
+        if (gcn.rfind("gfx110", 0) == 0)
+            cc[device] = CC_RDNA3;
+        else
+            cc[device] = CC_ADA;  // fallback: use Ada heuristics for other wave32 targets
 #else
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
         else if (prop.major >= 9) cc[device] = CC_HOPPER;

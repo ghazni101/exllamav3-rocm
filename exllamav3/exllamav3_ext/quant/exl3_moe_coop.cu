@@ -76,7 +76,7 @@ static bool moe_coop_pick_wide(int kslices, int slots, int device)
 {
     const int mode = moe_coop_wide_mode();
     if (mode >= 0) return mode != 0;
-    if (DevCtx::instance().get_cc(device) < CC_BLACKWELL) return true;
+    if (DevCtx::instance().get_cc(device) != CC_BLACKWELL) return true;
     return kslices >= 256 || (kslices >= 128 && slots >= 32);
 }
 

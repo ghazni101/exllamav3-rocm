@@ -112,6 +112,46 @@ __device__ inline void ptx_mma_m16n8k16
 #endif
 }
 
+// Paired 16x16 MMA: combines two adjacent 16x8 tiles into one call.
+// On gfx11 (RDNA3), uses hardware WMMA (single instruction, 16x16x16).
+// On other targets, falls back to two 16x8 MMA calls.
+
+// FP16 @ FP16 + FP32 -> FP32 (paired)
+__device__ inline void ptx_mma_m16n16k16
+(
+    const FragA& frag_a,
+    const FragB& frag_b0,
+    const FragB& frag_b1,
+    FragC& frag_c0,
+    FragC& frag_c1
+)
+{
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
+    wmma_m16n16k16_f32(frag_a, frag_b0, frag_b1, frag_c0, frag_c1);
+#else
+    ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
+    ptx_mma_m16n8k16(frag_a, frag_b1, frag_c1);
+#endif
+}
+
+// FP16 @ FP16 + FP16 -> FP16 (paired)
+__device__ inline void ptx_mma_m16n16k16
+(
+    const FragA& frag_a,
+    const FragB& frag_b0,
+    const FragB& frag_b1,
+    FragC_h& frag_c0,
+    FragC_h& frag_c1
+)
+{
+#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
+    wmma_m16n16k16_f16(frag_a, frag_b0, frag_b1, frag_c0, frag_c1);
+#else
+    ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
+    ptx_mma_m16n8k16(frag_a, frag_b1, frag_c1);
+#endif
+}
+
 // Global barrier
 
 __device__ inline void barrier_acquire
@@ -153,12 +193,19 @@ __device__ inline void barrier_release
     {
         if (reset)
         {
+#if defined(USE_ROCM)
+            __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+#else
+            asm volatile ("fence.acq_rel.gpu;\n");
             *lock = 0;
+#endif
             return;
         }
 #if defined(USE_ROCM)
-        __threadfence();
-        red_relaxed_gpu_add_i32(lock, val);
+        // Release-ordered atomic ensures all prior writes (output data) are
+        // visible before the lock value advances. Replaces the old __threadfence()
+        // + relaxed-add pair, which could reorder the store after the atomic.
+        __atomic_fetch_add(lock, val, __ATOMIC_RELEASE);
 #else
         asm volatile ("fence.acq_rel.gpu;\n");
         asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
