@@ -1,5 +1,6 @@
 #pragma once
 #include "../compat.cuh"
+#include "../hip_compat.cuh"
 
 #define ACT_SILU 0
 #define ACT_GELU 1

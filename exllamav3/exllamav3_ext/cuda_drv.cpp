@@ -26,23 +26,43 @@ const CudaDrv& CudaDrv::instance()
 {
     static CudaDrv d = []
     {
-        #ifdef _WIN32
-            void* lib = (void*) LoadLibraryA("nvcuda.dll");
-        #else
-            void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-            if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
-        #endif
-        TORCH_CHECK(lib, "Could not load the CUDA driver library");
+        #if defined(USE_ROCM)
+            #ifdef _WIN32
+                void* lib = (void*) LoadLibraryA("amdhip64.dll");
+            #else
+                void* lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
+                if (!lib) lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+            #endif
+            TORCH_CHECK(lib, "Could not load the HIP runtime library");
 
-        CudaDrv d{};
-        d.module_load_data                  = (decltype(&cuModuleLoadData))               drv_sym(lib, DRV_STR(cuModuleLoadData));
-        d.module_unload                     = (decltype(&cuModuleUnload))                 drv_sym(lib, DRV_STR(cuModuleUnload));
-        d.module_get_function               = (decltype(&cuModuleGetFunction))            drv_sym(lib, DRV_STR(cuModuleGetFunction));
-        d.func_set_attribute                = (decltype(&cuFuncSetAttribute))             drv_sym(lib, DRV_STR(cuFuncSetAttribute));
-        d.launch_kernel                     = (decltype(&cuLaunchKernel))                 drv_sym(lib, DRV_STR(cuLaunchKernel));
-        d.graph_kernel_node_get_params      = (decltype(&cuGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeGetParams));
-        d.graph_exec_kernel_node_set_params = (decltype(&cuGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(cuGraphExecKernelNodeSetParams));
-        return d;
+            CudaDrv d{};
+            d.module_load_data                  = (decltype(&hipModuleLoadData))               drv_sym(lib, DRV_STR(hipModuleLoadData));
+            d.module_unload                     = (decltype(&hipModuleUnload))                 drv_sym(lib, DRV_STR(hipModuleUnload));
+            d.module_get_function               = (decltype(&hipModuleGetFunction))            drv_sym(lib, DRV_STR(hipModuleGetFunction));
+            d.func_set_attribute                = (decltype(&hipFuncSetAttribute))             drv_sym(lib, DRV_STR(hipFuncSetAttribute));
+            d.launch_kernel                     = (decltype(&hipModuleLaunchKernel))           drv_sym(lib, DRV_STR(hipModuleLaunchKernel));
+            d.graph_kernel_node_get_params      = (decltype(&hipGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(hipGraphKernelNodeGetParams));
+            d.graph_exec_kernel_node_set_params = (decltype(&hipGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(hipGraphExecKernelNodeSetParams));
+            return d;
+        #else
+            #ifdef _WIN32
+                void* lib = (void*) LoadLibraryA("nvcuda.dll");
+            #else
+                void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+                if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+            #endif
+            TORCH_CHECK(lib, "Could not load the CUDA driver library");
+
+            CudaDrv d{};
+            d.module_load_data                  = (decltype(&cuModuleLoadData))               drv_sym(lib, DRV_STR(cuModuleLoadData));
+            d.module_unload                     = (decltype(&cuModuleUnload))                 drv_sym(lib, DRV_STR(cuModuleUnload));
+            d.module_get_function               = (decltype(&cuModuleGetFunction))            drv_sym(lib, DRV_STR(cuModuleGetFunction));
+            d.func_set_attribute                = (decltype(&cuFuncSetAttribute))             drv_sym(lib, DRV_STR(cuFuncSetAttribute));
+            d.launch_kernel                     = (decltype(&cuLaunchKernel))                 drv_sym(lib, DRV_STR(cuLaunchKernel));
+            d.graph_kernel_node_get_params      = (decltype(&cuGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeGetParams));
+            d.graph_exec_kernel_node_set_params = (decltype(&cuGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(cuGraphExecKernelNodeSetParams));
+            return d;
+        #endif
     }
     ();
     return d;

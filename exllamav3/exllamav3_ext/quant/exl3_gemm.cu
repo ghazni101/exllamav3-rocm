@@ -235,7 +235,14 @@ int exl3_gemm_gr
         }
     }
 
+#if defined(USE_ROCM)
+    // The cooperative autotuner explores (num_sms, concurrency) candidates; concurrency > 1
+    // co-schedules multiple blocks per SM, which deadlocks grid.sync() on RDNA (observed on
+    // gfx1100: hipOccupancyMaxActiveBlocksPerMultiprocessor overestimates co-residency).
+    bool autotune = false;
+#else
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
+#endif
     if (autotune)
     {
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
@@ -289,7 +296,7 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -572,7 +579,13 @@ int exl3_mgemm_gr
         }
     };
 
+#if defined(USE_ROCM)
+    // See exl3_gemm_gr: the cooperative autotuner's concurrency > 1 candidates deadlock
+    // grid.sync() on RDNA, so autotuning is disabled on ROCm.
+    bool autotune = false;
+#else
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
+#endif
     if (autotune)
     {
         uint64_t autotune_key = mgemm_autotune_hash
@@ -647,7 +660,7 @@ int exl3_mgemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         kernel_attr_set[device].insert((void*) kernel);
     }
 

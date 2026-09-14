@@ -130,6 +130,12 @@ bool exl3_gemv_try_launch
         if (it != cache.end()) return it->second;
         int blocks_per_sm;
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+#if defined(USE_ROCM)
+        // hipOccupancyMaxActiveBlocksPerMultiprocessor overestimates co-residency on RDNA:
+        // kernels reporting N blocks/SM can deadlock grid.sync() when all N are scheduled
+        // (observed on gfx1100: reported 3, real limit 2). Launch one fewer per SM.
+        if (blocks_per_sm > 1) blocks_per_sm -= 1;
+#endif
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };
