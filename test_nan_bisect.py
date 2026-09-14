@@ -2,7 +2,7 @@
 """NaN bisection diagnostic for exllamav3 ROCm.
 
 Hooks every module's forward pass to detect the first layer producing NaN.
-Tests 1-token (GEMV path) vs multi-token (GEMM path) to confirm the bug is
+Tests 1-token (decode path) vs multi-token (prefill path) to confirm the bug is
 sequence-length dependent.
 
 Usage:
@@ -20,17 +20,16 @@ def main():
         "--model",
         default="/models/exl3/turboderp/Qwen3.8-27B-SC_4.00bpw_H5_V6",
     )
-    parser.add_argument("--seq-len", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=7)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     args = parser.parse_args()
 
-    from exllamav3 import Cache, Config, Model, Tokenizer
+    from exllamav3 import Config, Model, Tokenizer
 
     config = Config.from_directory(args.model)
-    config.max_seq_len = args.max_seq_len
     model = Model.from_config(config)
     print("Loading model...")
-    model.load()
+    model.load(device="cuda")
     print("Model loaded.")
     tokenizer = Tokenizer.from_config(config)
 
@@ -62,11 +61,11 @@ def main():
         module.forward = hooked_forward
 
     # Install hooks on all modules
-    for name, module in model.modules.named_modules():
-        make_hook(name, module)
+    for module in model:
+        make_hook(getattr(module, "key", type(module).__name__), module)
 
-    # Test 1: single token (GEMV path)
-    print("\n=== Test 1: single token (GEMV path) ===")
+    # Test 1: single token (decode path)
+    print("\n=== Test 1: single token (decode path) ===")
     nan_found[0] = False
     first_nan_module[0] = None
     ids = tokenizer.encode("Hello")
@@ -75,12 +74,11 @@ def main():
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
     else:
-        input_ids = torch.tensor([ids], dtype=torch.long, device="cuda")
+        input_ids = torch.tensor([[ids]], dtype=torch.long, device="cuda")
     print(f"  input_ids shape: {input_ids.shape}")
 
-    cache1 = Cache(model, max_num_tokens=args.max_seq_len)
     with torch.no_grad():
-        logits = model.forward(input_ids, cache=cache1)
+        logits = model.forward(input_ids=input_ids, params={})
     torch.cuda.synchronize()
     has_nan = torch.isnan(logits).any().item()
     print(f"  1 token: NaN={has_nan}", end="")
@@ -91,11 +89,11 @@ def main():
     if first_nan_module[0]:
         print(f"  First NaN at: {first_nan_module[0]}")
 
-    # Test 2: multi-token (GEMM path)
+    # Test 2: multi-token (prefill path)
     for seq_len in [2, 4, 7]:
         if seq_len > args.seq_len:
             break
-        print(f"\n=== Test 2: {seq_len} tokens (GEMM path) ===")
+        print(f"\n=== Test 2: {seq_len} tokens (prefill path) ===")
         nan_found[0] = False
         first_nan_module[0] = None
         text = "Hello, how are you today?"[: seq_len * 3]
@@ -111,9 +109,8 @@ def main():
             input_ids = input_ids[:, :seq_len]
         print(f"  input_ids shape: {input_ids.shape}")
 
-        cache_n = Cache(model, max_num_tokens=args.max_seq_len)
         with torch.no_grad():
-            logits = model.forward(input_ids, cache=cache_n)
+            logits = model.forward(input_ids=input_ids, params={})
         torch.cuda.synchronize()
         has_nan = torch.isnan(logits).any().item()
         print(f"  {seq_len} tokens: NaN={has_nan}", end="")

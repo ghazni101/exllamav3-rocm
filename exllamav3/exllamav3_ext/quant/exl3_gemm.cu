@@ -296,9 +296,11 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
+        #if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
+        #endif
+        kernel_attr_set[device].insert((void*) kernel);
     }
     cudaLaunchCooperativeKernel
     (
@@ -660,7 +662,9 @@ int exl3_mgemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
+        #if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        #endif
         kernel_attr_set[device].insert((void*) kernel);
     }
 

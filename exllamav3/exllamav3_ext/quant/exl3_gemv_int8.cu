@@ -152,7 +152,9 @@ static bool exl3_gemv_int8_sq
 
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
+#if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
+#endif
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
@@ -282,7 +284,9 @@ bool exl3_gemv_int8
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
+#if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+#endif
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in

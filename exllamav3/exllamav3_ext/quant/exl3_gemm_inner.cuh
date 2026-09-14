@@ -330,6 +330,36 @@ void exl3_gemm_kernel_inner
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
+        // Zero out A fragment elements for rows >= size_m. On ROCm, the MMA
+        // emulation uses __shfl_sync to gather across all 32 lanes, so
+        // uninitialized rows (>= size_m) in shared memory can contain NaN bit
+        // patterns that propagate to valid output rows via the shuffle.
+        // On NVIDIA the hardware MMA reads each lane's fragment independently,
+        // so this contamination doesn't occur.
+        #if defined(USE_ROCM)
+        {
+            int g = lane_id / 4;
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            {
+                int row_lo = m * 16 + g;
+                int row_hi = row_lo + 8;
+                int idx = (TILEBLOCKS_M == 1) ? buf : m;
+                if (row_lo >= size_m)
+                {
+                    half2 z = __float2half2_rn(0.0f);
+                    frag_a[idx][0] = z; frag_a[idx][1] = z;
+                    frag_a[idx][2] = z; frag_a[idx][3] = z;
+                }
+                else if (row_hi >= size_m)
+                {
+                    half2 z = __float2half2_rn(0.0f);
+                    frag_a[idx][1] = z;
+                    frag_a[idx][3] = z;
+                }
+            }
+        }
+        #endif
 
         // B fragments
         #pragma unroll

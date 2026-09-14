@@ -39,17 +39,17 @@ def test_gemm(m, k, n, bits=5, cb=2):
     # B shape: (k//16, n//16, 16*K) where K = bits
     K = bits
     B_shape = (k // 16, n // 16, 16 * K)
-    B = torch.randint(0, 65535, B_shape, device=device, dtype=torch.int16)
+    B = torch.randint(0, 32767, B_shape, device=device, dtype=torch.int16)
 
     # Create output C (f32 accumulation)
     C = torch.empty(m, n, device=device, dtype=torch.float32)
 
     # Create suh (input scales) and A_had (Hadamard scratch)
-    suh = torch.randn(k // 16, device=device, dtype=dtype) * 0.01
+    suh = torch.randn(k, device=device, dtype=dtype) * 0.01
     A_had = torch.empty_like(A)
 
     # Create svh (output scales)
-    svh = torch.randn(n // 16, device=device, dtype=dtype) * 0.01
+    svh = torch.randn(n, device=device, dtype=dtype) * 0.01
 
     # Call exl3_gemm
     # exl3_gemm(A, B, C, suh, A_had, svh, force_shape_idx, mcg, mul1, force_num_sms)
@@ -91,7 +91,7 @@ def test_gemm_no_scales(m, k, n, bits=5, cb=0):
 
     K = bits
     B_shape = (k // 16, n // 16, 16 * K)
-    B = torch.randint(0, 65535, B_shape, device=device, dtype=torch.int16)
+    B = torch.randint(0, 32767, B_shape, device=device, dtype=torch.int16)
 
     C = torch.empty(m, n, device=device, dtype=torch.float32)
 
