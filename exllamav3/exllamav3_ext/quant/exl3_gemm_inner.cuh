@@ -920,12 +920,12 @@ void exl3_gemm_kernel_inner
         if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
-            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            for (int n = 0; n < FRAGS_N_PER_WARP; n += 2)
             {
                 #if EXL3_GEMM_H_ACC
-                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[0][n]);
+                    ptx_mma_m16n16k16(frag_a[buf], frag_b[buf][n], frag_b[buf][n+1], frag_c_h[0][n], frag_c_h[0][n+1]);
                 #else
-                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[0][n]);
+                    ptx_mma_m16n16k16(frag_a[buf], frag_b[buf][n], frag_b[buf][n+1], frag_c[0][n], frag_c[0][n+1]);
                 #endif
             }
         }
@@ -934,12 +934,12 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
                 #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                for (int n = 0; n < FRAGS_N_PER_WARP; n += 2)
                 {
                     #if EXL3_GEMM_H_ACC
-                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
+                        ptx_mma_m16n16k16(frag_a[m], frag_b[buf][n], frag_b[buf][n+1], frag_c_h[m][n], frag_c_h[m][n+1]);
                     #else
-                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
+                        ptx_mma_m16n16k16(frag_a[m], frag_b[buf][n], frag_b[buf][n+1], frag_c[m][n], frag_c[m][n+1]);
                     #endif
                 }
         }

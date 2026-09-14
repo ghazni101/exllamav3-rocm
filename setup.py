@@ -65,6 +65,10 @@ sources = [
     for root, _, files in os.walk(sources_dir)
     for file in files
     if file.endswith(('.c', '.cpp', '.cu'))
+    # Skip hipify outputs: they are regenerated in-place by torch's BuildExtension
+    # on every ROCm rebuild, and compiling them alongside their non-hipified
+    # counterparts produces duplicate-symbol link errors.
+    and '_hip.' not in file and not file.startswith('hip_')
 ]
 
 setup_kwargs = (
