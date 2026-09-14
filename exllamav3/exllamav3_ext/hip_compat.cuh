@@ -405,8 +405,11 @@ __device__ __forceinline__ void ldsm4(FragA& frag_a, const void* smem_ptr)
 
 __device__ __forceinline__ half2 shfl_h2(half2 v, int src)
 {
-    uint32_t u = __shfl_sync(EXL3_FULL_WARP_MASK, *(uint32_t*) &v, src);
-    return *(half2*) &u;
+    // Use __builtin_bit_cast to avoid taking the address of v, which would
+    // force a stack spill and cause __shfl_sync to read from memory instead of VGPR.
+    uint32_t u = __builtin_bit_cast(uint32_t, v);
+    u = __shfl_sync(EXL3_FULL_WARP_MASK, u, src);
+    return __builtin_bit_cast(half2, u);
 }
 
 __device__ __forceinline__ void mma_m16n8k16_gather
@@ -542,29 +545,46 @@ __device__ __forceinline__ WmmaA16 ptx_to_wmma_a(const FragA& frag_a)
     WmmaA16 result;
     half2* r = reinterpret_cast<half2*>(&result);
 
-    // elem = (row>=8?1:0) + (j>=4?2:0) → {0,1,2,3}
-    // Switch ensures compile-time constant VGPR for __shfl_sync.
-    #define SHFL_A(dst, src_lane, e) \
-        switch (e) { \
-            case 0: dst = shfl_h2(a[0], src_lane); break; \
-            case 1: dst = shfl_h2(a[1], src_lane); break; \
-            case 2: dst = shfl_h2(a[2], src_lane); break; \
-            case 3: dst = shfl_h2(a[3], src_lane); break; \
-        }
+    // Load all 4 elements into named VGPRs (uniform, no divergence).
+    half2 va0 = a[0], va1 = a[1], va2 = a[2], va3 = a[3];
 
     int base = (row % 8) * 4;
     int e_lo = (row >= 8) ? 1 : 0;  // a[0] or a[1] for k<8
     int e_hi = (row >= 8) ? 3 : 2;  // a[2] or a[3] for k>=8
 
-    SHFL_A(r[0], base + 0, e_lo)
-    SHFL_A(r[1], base + 1, e_lo)
-    SHFL_A(r[2], base + 2, e_lo)
-    SHFL_A(r[3], base + 3, e_lo)
-    SHFL_A(r[4], base + 0, e_hi)
-    SHFL_A(r[5], base + 1, e_hi)
-    SHFL_A(r[6], base + 2, e_hi)
-    SHFL_A(r[7], base + 3, e_hi)
-    #undef SHFL_A
+    // Shuffle all 4 elements from each of the 4 source lanes (16 shuffles).
+    // All lanes execute all shuffles — no wave divergence.
+    // Source lane base+0
+    half2 s00 = shfl_h2(va0, base + 0);
+    half2 s01 = shfl_h2(va1, base + 0);
+    half2 s02 = shfl_h2(va2, base + 0);
+    half2 s03 = shfl_h2(va3, base + 0);
+    // Source lane base+1
+    half2 s10 = shfl_h2(va0, base + 1);
+    half2 s11 = shfl_h2(va1, base + 1);
+    half2 s12 = shfl_h2(va2, base + 1);
+    half2 s13 = shfl_h2(va3, base + 1);
+    // Source lane base+2
+    half2 s20 = shfl_h2(va0, base + 2);
+    half2 s21 = shfl_h2(va1, base + 2);
+    half2 s22 = shfl_h2(va2, base + 2);
+    half2 s23 = shfl_h2(va3, base + 2);
+    // Source lane base+3
+    half2 s30 = shfl_h2(va0, base + 3);
+    half2 s31 = shfl_h2(va1, base + 3);
+    half2 s32 = shfl_h2(va2, base + 3);
+    half2 s33 = shfl_h2(va3, base + 3);
+
+    // Select: r[j] = shuffle of a[e] from lane base+(j%4).
+    // e_lo is 0 or 1; e_hi is 2 or 3. Select AFTER shuffle (no divergence in shuffles).
+    r[0] = (e_lo == 0) ? s00 : s01;
+    r[1] = (e_lo == 0) ? s10 : s11;
+    r[2] = (e_lo == 0) ? s20 : s21;
+    r[3] = (e_lo == 0) ? s30 : s31;
+    r[4] = (e_hi == 2) ? s02 : s03;
+    r[5] = (e_hi == 2) ? s12 : s13;
+    r[6] = (e_hi == 2) ? s22 : s23;
+    r[7] = (e_hi == 2) ? s32 : s33;
 
     return result;
 }
@@ -590,33 +610,35 @@ __device__ __forceinline__ WmmaB16 ptx_to_wmma_b(const FragB& frag_b0, const Fra
     WmmaB16 result;
     half2* r = reinterpret_cast<half2*>(&result);
 
-    // Switch ensures compile-time constant VGPR for __shfl_sync.
-    #define SHFL_B0(dst, src, be) \
-        switch (be) { \
-            case 0: dst = shfl_h2(b0[0], src); break; \
-            case 1: dst = shfl_h2(b0[1], src); break; \
-        }
-    #define SHFL_B1(dst, src, be) \
-        switch (be) { \
-            case 0: dst = shfl_h2(b1[0], src); break; \
-            case 1: dst = shfl_h2(b1[1], src); break; \
-        }
+    // Load all 4 elements into named VGPRs (uniform, no divergence).
+    half2 vb00 = b0[0], vb01 = b0[1], vb10 = b1[0], vb11 = b1[1];
 
     int base = (col % 8) * 4;
 
-    // j=0..3: k<8, b_elem=0. j=4..7: k>=8, b_elem=1.
+    // Shuffle all 4 elements from each of the 4 source lanes (16 shuffles).
+    // All lanes execute all shuffles — no wave divergence.
+    // shuffles[s][e]: s=source lane index (0..3), e=element (0=b0[0], 1=b0[1], 2=b1[0], 3=b1[1])
+    half2 shuffles[4][4];
+    #pragma unroll
+    for (int s = 0; s < 4; ++s)
+    {
+        shuffles[s][0] = shfl_h2(vb00, base + s);
+        shuffles[s][1] = shfl_h2(vb01, base + s);
+        shuffles[s][2] = shfl_h2(vb10, base + s);
+        shuffles[s][3] = shfl_h2(vb11, base + s);
+    }
+
+    // Select: r[j] = b[be] from lane base+(j%4), from frag_b0 if col<8, frag_b1 if col>=8.
+    // be = 0 for j<4, be = 1 for j>=4.
+    // elem = be + (col >= 8 ? 2 : 0): 0=b0[0], 1=b0[1], 2=b1[0], 3=b1[1].
     #pragma unroll
     for (int j = 0; j < 8; ++j)
     {
         int be = j < 4 ? 0 : 1;
-        int src = base + (j % 4);
-        half2 v0, v1;
-        SHFL_B0(v0, src, be)
-        SHFL_B1(v1, src, be)
-        r[j] = (col < 8) ? v0 : v1;
+        int s = j % 4;
+        int elem = be + (col >= 8 ? 2 : 0);
+        r[j] = shuffles[s][elem];
     }
-    #undef SHFL_B0
-    #undef SHFL_B1
 
     return result;
 }
@@ -644,36 +666,39 @@ __device__ __forceinline__ void wmma_to_ptx_c(const WmmaC32& wmma_c, FragC& frag
     // d0[3] = D[g+8][2t+1]: WMMA lane (g%2)*16 + 2t+1, reg g/2 + 4
     // d1[0..3] same with +8 lane offset (columns 8-15)
 
-    int e0 = g / 2;       // register for row g
-    int e1 = g / 2 + 4;   // register for row g+8
+    int e0 = g / 2;       // register for row g (0..3)
+    int e1 = g / 2 + 4;   // register for row g+8 (4..7)
     int lane_base = (g % 2) * 16;
 
-    // Switch ensures compile-time constant VGPR for __shfl_sync.
-    #define WMMA_SHFL(dst, src, e) \
-        switch (e) { \
-            case 0: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[0], src); break; \
-            case 1: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[1], src); break; \
-            case 2: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[2], src); break; \
-            case 3: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[3], src); break; \
-            case 4: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[4], src); break; \
-            case 5: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[5], src); break; \
-            case 6: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[6], src); break; \
-            case 7: dst = __shfl_sync(EXL3_FULL_WARP_MASK, c[7], src); break; \
-        }
+    // Load all 8 WMMA C elements into named VGPRs (uniform, no divergence).
+    float cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) cv[i] = c[i];
 
-    // FragC0: columns 0-7
-    WMMA_SHFL(d0[0], lane_base + 2 * t,     e0)
-    WMMA_SHFL(d0[1], lane_base + 2 * t + 1, e0)
-    WMMA_SHFL(d0[2], lane_base + 2 * t,     e1)
-    WMMA_SHFL(d0[3], lane_base + 2 * t + 1, e1)
+    // 4 source lanes: lane_base+2t, lane_base+2t+1, lane_base+2t+8, lane_base+2t+9.
+    int src_lanes[4] = {lane_base + 2*t, lane_base + 2*t + 1, lane_base + 2*t + 8, lane_base + 2*t + 9};
 
-    // FragC1: columns 8-15
-    WMMA_SHFL(d1[0], lane_base + 2 * t + 8, e0)
-    WMMA_SHFL(d1[1], lane_base + 2 * t + 9, e0)
-    WMMA_SHFL(d1[2], lane_base + 2 * t + 8, e1)
-    WMMA_SHFL(d1[3], lane_base + 2 * t + 9, e1)
+    // Shuffle all 8 elements from each of the 4 source lanes (32 shuffles).
+    // All lanes execute all shuffles — no wave divergence.
+    float shuffles[4][8];
+    #pragma unroll
+    for (int s = 0; s < 4; ++s)
+    {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e)
+            shuffles[s][e] = __shfl_sync(EXL3_FULL_WARP_MASK, cv[e], src_lanes[s]);
+    }
 
-    #undef WMMA_SHFL
+    // Select: d0[0]=c[e0] from S0, d0[1]=c[e0] from S1, d0[2]=c[e1] from S0, d0[3]=c[e1] from S1
+    //          d1[0]=c[e0] from S2, d1[1]=c[e0] from S3, d1[2]=c[e1] from S2, d1[3]=c[e1] from S3
+    d0[0] = shuffles[0][e0];
+    d0[1] = shuffles[1][e0];
+    d0[2] = shuffles[0][e1];
+    d0[3] = shuffles[1][e1];
+    d1[0] = shuffles[2][e0];
+    d1[1] = shuffles[3][e0];
+    d1[2] = shuffles[2][e1];
+    d1[3] = shuffles[3][e1];
 }
 
 // WMMA 16x16x16 fp16→fp32: replaces two emulated mma_m16n8k16_f32 calls.
