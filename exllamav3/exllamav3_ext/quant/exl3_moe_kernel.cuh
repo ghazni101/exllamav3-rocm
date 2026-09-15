@@ -291,11 +291,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     if (block_idx == 0 && threadIdx.x == 0)
     {
 #if defined(USE_ROCM)
-        int retired = __atomic_fetch_add(&sched[1], 1, __ATOMIC_ACQ_REL);
+        int retired = __hip_atomic_fetch_add(&sched[1], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (retired == num_groups - 1)
         {
-            __atomic_store_n(&sched[0], 0, __ATOMIC_RELAXED);
-            __atomic_store_n(&sched[1], 0, __ATOMIC_RELAXED);
+            __hip_atomic_store(&sched[0], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(&sched[1], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
 #else
         cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);

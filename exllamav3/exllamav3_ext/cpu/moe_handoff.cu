@@ -66,7 +66,6 @@ namespace {
 typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, uint32_t, unsigned int, uint32_t);
 typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, uint32_t, unsigned int);
 
-
 struct MemOps
 {
     fn_stream_wait32 wait = nullptr;
@@ -74,19 +73,12 @@ struct MemOps
     bool resolved = false;
     MemOps()
     {
-#ifdef __linux__
-        void* h = dlopen("libamdhip64.so.7", RTLD_LAZY | RTLD_NOLOAD);
-        if (!h) h = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_NOLOAD);
-        if (!h) return;
-        wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
-        write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
-#else
-        HMODULE h = GetModuleHandleA("amdhip64.dll");
-        if (!h) return;
-        wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
-        write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
-#endif
-        resolved = wait && write;
+        // Unlike the CUDA path these are runtime-API entry points, exported by the
+        // libamdhip64 the extension already links against: resolve them directly instead
+        // of dlopen-ing a versioned soname.
+        wait = &hipStreamWaitValue32;
+        write = &hipStreamWriteValue32;
+        resolved = true;
     }
 };
 #else
