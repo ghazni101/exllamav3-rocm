@@ -61,11 +61,7 @@ __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
 #if defined(USE_ROCM)
     // dp4a.u32.s32: unsigned bytes of a, signed bytes of b, signed accumulate
-    int d = c;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-        d += (int) ((a >> (8 * i)) & 0xff) * (int) ((int8_t) ((b >> (8 * i)) & 0xff));
-    return d;
+    return __dp4a(a, (int) b, c);
 #else
     int d;
     asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));

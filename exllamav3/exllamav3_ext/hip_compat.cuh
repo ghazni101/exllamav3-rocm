@@ -124,31 +124,40 @@ __device__ __forceinline__ void __nanosleep(uint32_t ns)
     while (iters-- > 0) __builtin_amdgcn_s_sleep(127);
 }
 
-// __dp4a: 4-way byte dot product. gfx11+ has v_sudot4 (dot8-insts) which handles
-// all signed/unsigned combinations natively. Fall back to scalar expansion on
-// older targets that lack dot8-insts.
+// __dp4a: 4-way byte dot product. gfx11+ has v_dot4_i32_iu8 / v_dot4_u32_u8
+// (exposed as __builtin_amdgcn_sudot4 / __builtin_amdgcn_udot4); the signed×signed
+// form is expressed via the u8 bias trick: s8(x) = u8(x^0x80) - 128 per byte.
+// Older targets fall back to per-byte multiply-adds. Signedness follows the CUDA
+// overloads.
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
-    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_sudot4)
+#define EXL3_HAS_DOT4 1
+#endif
+#endif
+
+#if defined(EXL3_HAS_DOT4)
 
 __device__ __forceinline__ int __dp4a(int a, int b, int c)
 {
-    return __builtin_amdgcn_sudot4(false, a, false, b, c, false);
+    // s8·s8 = s8·(u8^0x80) - 128·Σs8(a); Σs8(a) = s8(a)·u8(1)
+    return __builtin_amdgcn_sudot4(true, a, false, b ^ 0x80808080, c, 0)
+         - 128 * __builtin_amdgcn_sudot4(true, a, false, 0x01010101, 0, 0);
 }
 
 __device__ __forceinline__ int __dp4a(unsigned int a, int b, int c)
 {
-    return __builtin_amdgcn_sudot4(true, a, false, b, c, false);
+    return __builtin_amdgcn_sudot4(false, (int) a, true, b, c, 0);
 }
 
 __device__ __forceinline__ int __dp4a(int a, unsigned int b, int c)
 {
-    return __builtin_amdgcn_sudot4(false, a, true, b, c, false);
+    return __builtin_amdgcn_sudot4(true, a, false, (int) b, c, 0);
 }
 
 __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c)
 {
-    return (unsigned int)__builtin_amdgcn_sudot4(true, a, true, b, (int)c, false);
+    return __builtin_amdgcn_udot4(a, b, c, false);
 }
 
 #else
@@ -189,7 +198,7 @@ __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, u
     return r;
 }
 
-#endif
+#endif  // EXL3_HAS_DOT4
 
 // L2-coherent loads (ld.global.cg). On AMD a plain load is L2-coherent; the hint only
 // affects L1, so these degrade to normal loads.
