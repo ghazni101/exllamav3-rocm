@@ -19,7 +19,13 @@ TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, i
     cuda_check_drv(drv.module_load_data(&mod, data.data()));
     cuda_check_drv(drv.module_get_function(&fn, mod, name.c_str()));
     if (shared_bytes > 48 * 1024)
+    {
+#if defined(USE_ROCM)
+        cuda_check_drv(drv.func_set_attribute(fn, hipFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+#else
         cuda_check_drv(drv.func_set_attribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes));
+#endif
+    }
 
 #if defined(USE_ROCM)
     // Triton's num_warps counts hardware warps; the launch block size is

@@ -85,6 +85,10 @@ using FragC_h = Vec<half2, 2>;
 
 #if defined(__HIPCC__)
 
+// The functions below intentionally keep the CUDA builtin names so call sites stay
+// identical across platforms. If a future HIP version adds any of them, the build
+// breaks loudly (redefinition) — delete the shim then; do not rename the call sites.
+
 // HIP provides __hmax/__hmin for __half but not the __half2 forms.
 
 __device__ __forceinline__ __half2 __hmax2(__half2 a, __half2 b)
@@ -226,12 +230,10 @@ __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
     __builtin_nontemporal_store(v, p);
 }
 
-__device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
-{
-    // Single 128-bit nontemporal store via vector reinterpret.
-    typedef int __attribute__((ext_vector_type(4))) int4_v;
-    *reinterpret_cast<int4_v*>(p) = *reinterpret_cast<const int4_v*>(&v);
-}
+// NOTE: no stg_wt_u128 here. The CUDA original is a single st.global.wt.v4.u32; the only
+// faithful HIP emulation would be four nontemporal stores, which is not single-copy
+// atomic. Nothing uses it; add it back only for consumers that don't pack flag+data in
+// one 128-bit word.
 
 __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 {
@@ -247,38 +249,40 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 }
 
 // System-scope acquire/release for the TP collectives (ll.cuh, barrier_inner.cuh).
-// GCN atomics are system-coherent; the ordering comes from the atomics themselves.
+// __atomic_* builtins emit agent-scope (device) atomics on AMDGCN; the __hip_atomic_*
+// forms take an explicit scope, and these paths synchronize with the host and peer
+// GPUs, so they need __HIP_MEMORY_SCOPE_SYSTEM.
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
-    return __atomic_load_n((const uint32_t*) p, __ATOMIC_ACQUIRE);
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
-    return __atomic_load_n((const uint64_t*) p, __ATOMIC_ACQUIRE);
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 // Device-scope acquire/release used by the inter-block barriers in ptx.cuh.
 
 __device__ __forceinline__ int ldg_acquire_gpu_i32(const int* p)
 {
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void red_relaxed_gpu_add_i32(int* p, int v)
 {
-    __atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+    __hip_atomic_fetch_add(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // Global real-time clock in nanoseconds (matching %globaltimer). CDNA has

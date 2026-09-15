@@ -423,17 +423,17 @@ __device__ inline void group_barrier
         int* counter_p = &barrier_counters_sense[group_id * 2];
         int* sense_p = &barrier_counters_sense[group_id * 2 + 1];
 
-        int old_sense = __atomic_load_n(sense_p, __ATOMIC_RELAXED);
-        int old = __atomic_fetch_add(counter_p, 1, __ATOMIC_ACQ_REL);
+        int old_sense = __hip_atomic_load(sense_p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        int old = __hip_atomic_fetch_add(counter_p, 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
 
         if (old == group_size - 1)
         {
-            __atomic_store_n(counter_p, 0, __ATOMIC_RELAXED);
-            __atomic_store_n(sense_p, 1 - old_sense, __ATOMIC_RELEASE);
+            __hip_atomic_store(counter_p, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(sense_p, 1 - old_sense, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
         else
         {
-            while (__atomic_load_n(sense_p, __ATOMIC_ACQUIRE) == old_sense) __nanosleep(32);
+            while (__hip_atomic_load(sense_p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == old_sense) __nanosleep(32);
         }
 #else
         cuda::atomic_ref<int, cuda::thread_scope_device> counter(barrier_counters_sense[group_id * 2]);

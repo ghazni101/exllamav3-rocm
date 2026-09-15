@@ -37,6 +37,19 @@ struct CudaDrv
     static const CudaDrv& instance();
 };
 
+#if defined(USE_ROCM)
+#define cuda_check_drv(res) \
+do \
+{ \
+    hipError_t res_ = (res); \
+    if (res_ != hipSuccess) \
+    { \
+        fprintf(stderr, "HIP error %d (%s): %s %d\n", (int) res_, hipGetErrorName(res_), __FILE__, __LINE__); \
+        TORCH_CHECK(false, "HIP driver/runtime error"); \
+    } \
+} \
+while(false)
+#else
 #define cuda_check_drv(res) \
 do \
 { \
@@ -48,3 +61,4 @@ do \
     } \
 } \
 while(false)
+#endif
