@@ -235,14 +235,10 @@ int exl3_gemm_gr
         }
     }
 
-#if defined(USE_ROCM)
-    // The cooperative autotuner explores (num_sms, concurrency) candidates; concurrency > 1
-    // co-schedules multiple blocks per SM, which deadlocks grid.sync() on RDNA (observed on
-    // gfx1100: hipOccupancyMaxActiveBlocksPerMultiprocessor overestimates co-residency).
-    bool autotune = false;
-#else
+    // On ROCm the autotuner itself clamps concurrency to 1 (see tune() in
+    // coop_autotune.cu): RDNA over-reports cooperative co-residency and
+    // concurrency > 1 deadlocks grid.sync(). (shape, num_sms) tuning still applies.
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
-#endif
     if (autotune)
     {
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
@@ -581,13 +577,8 @@ int exl3_mgemm_gr
         }
     };
 
-#if defined(USE_ROCM)
-    // See exl3_gemm_gr: the cooperative autotuner's concurrency > 1 candidates deadlock
-    // grid.sync() on RDNA, so autotuning is disabled on ROCm.
-    bool autotune = false;
-#else
+    // See exl3_gemm_gr: on ROCm the autotuner clamps concurrency to 1 internally.
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
-#endif
     if (autotune)
     {
         uint64_t autotune_key = mgemm_autotune_hash

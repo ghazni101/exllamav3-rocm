@@ -525,7 +525,13 @@ CoopAutotuneLaunch tune
         TORCH_CHECK(base.kernel, "CoopKernelAutotuner: null kernel candidate");
         TORCH_CHECK(base.block_dim > 0, "CoopKernelAutotuner: invalid block_dim");
         TORCH_CHECK(base.max_num_sms > 0, "CoopKernelAutotuner: invalid max_num_sms");
+#if defined(USE_ROCM)
+        // RDNA over-reports cooperative co-residency: concurrency > 1 deadlocks
+        // grid.sync() (observed on gfx1100). Explore (shape, num_sms) only.
+        int max_concurrency = 1;
+#else
         int max_concurrency = MAX(base.max_concurrency, 1);
+#endif
         int total_sms = base.total_sms > 0 ? base.total_sms : base.max_num_sms;
 
         if (max_concurrency > 1 || base.max_num_sms == 1)
