@@ -113,8 +113,10 @@ __device__ inline void ptx_mma_m16n8k16
 }
 
 // Paired 16x16 MMA: combines two adjacent 16x8 tiles into one call.
-// On gfx11 (RDNA3), uses hardware WMMA (single instruction, 16x16x16).
-// On other targets, falls back to two 16x8 MMA calls.
+// On gfx11 (RDNA3), uses hardware WMMA (single instruction, 16x16x16) when built
+// with -DEXL3_WMMA (EXL3_WMMA=1 at build time). Default off: the WMMA path has a
+// known NaN bug on the M>=3 GEMM shapes (see rocm-optimize history); the emulated
+// mma_m16n8k16 path is the verified fallback.
 
 // FP16 @ FP16 + FP32 -> FP32 (paired)
 __device__ inline void ptx_mma_m16n16k16
@@ -126,7 +128,7 @@ __device__ inline void ptx_mma_m16n16k16
     FragC& frag_c1
 )
 {
-#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
+#if defined(USE_ROCM) && defined(EXL3_WMMA) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
     wmma_m16n16k16_f32(frag_a, frag_b0, frag_b1, frag_c0, frag_c1);
 #else
     ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
@@ -144,7 +146,7 @@ __device__ inline void ptx_mma_m16n16k16
     FragC_h& frag_c1
 )
 {
-#if defined(USE_ROCM) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
+#if defined(USE_ROCM) && defined(EXL3_WMMA) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__))
     wmma_m16n16k16_f16(frag_a, frag_b0, frag_b1, frag_c0, frag_c1);
 #else
     ptx_mma_m16n8k16(frag_a, frag_b0, frag_c0);
@@ -153,7 +155,6 @@ __device__ inline void ptx_mma_m16n16k16
 }
 
 // Global barrier
-
 __device__ inline void barrier_acquire
 (
     int* lock,
