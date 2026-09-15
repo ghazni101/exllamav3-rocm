@@ -1,0 +1,48 @@
+# ROCm 10 serving/build image for exllamav3 on RDNA3 (gfx1101 / RX 7700 XT).
+# Base image local/rocm-base:10.0.0 ships a native ROCM 10.0 SDK (amdrocm-core-dev10.0-gfx1101)
+# under /opt/rocm with hipcc, hipBLAS and rocprofv3. Torch is the rocm7.14 wheel — keep
+# --no-deps so it cannot pull the (header-less) wheel SDK over the image's native install.
+#
+# Build:   docker build -f Dockerfile.rocm10 -t local/exl3-rocm:gfx1101 .
+# Run:     docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+#            --group-add video --group-add render \
+#            -v /path/to/model:/models/qwen38-27b:ro local/exl3-rocm:gfx1101
+#
+# The HIP extension is compiled at build time for the arch in PYTORCH_ROCM_ARCH
+# (default gfx1101; override with --build-arg PYTORCH_ROCM_ARCH=gfx1100 for RDNA3 iGPU-class parts).
+
+FROM local/rocm-base:10.0.0
+ARG PYTORCH_ROCM_ARCH=gfx1101
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm
+ENV PATH=/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    python3-dev python3-pip python3-venv ninja-build g++ && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -q --upgrade pip
+
+# Torch ROCm wheel. --no-deps + explicit runtime deps mirrors the known-good recipe;
+# triton-rocm (not triton) is required for the triton attention path on ROCm.
+RUN /opt/venv/bin/pip install --no-cache-dir --no-deps \
+    --index-url https://download.pytorch.org/whl/rocm7.14 torch==2.14.0+rocm7.14 && \
+    /opt/venv/bin/pip install --no-cache-dir -q \
+    filelock typing-extensions sympy networkx jinja2 fsspec setuptools ninja \
+    fastapi uvicorn tokenizers numpy rich safetensors pillow pyyaml marisa_trie \
+    pydantic llguidance && \
+    /opt/venv/bin/pip install --no-cache-dir -q \
+    --index-url https://download.pytorch.org/whl/rocm7.14 "triton-rocm~=3.8.0"
+
+WORKDIR /opt/exllamav3
+COPY . /opt/exllamav3
+# Non-editable install forces the C++/HIP extension to compile at build time.
+# --no-deps keeps pip from replacing the ROCm torch wheel with the CUDA one.
+RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} MAX_JOBS=16 \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -5
+
+ENV EXL3_MODEL=/models/qwen38-27b
+ENV EXL3_CACHE_TOKENS=32768
+ENV PORT=9001
+EXPOSE 9001
+CMD ["python3", "/opt/exllamav3/serve_rocm.py"]
