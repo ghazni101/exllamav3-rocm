@@ -319,7 +319,7 @@ __device__ __forceinline__ void gemv_int8_row_sums
 #define SQ_KSPLIT_CAP 64
 #define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
 #define SQ_ROWS_MAX 512     // shared memory cap
-#define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
+#define SQ_COUNTERS_CAP 65536                                   // fixed counter region: shared by sq (nb256 ints) and msq (jj x nb256_max)
 #define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)    // sq-private region at workspace start (counters + per-slice-per-row scales, m <= 4)
 
 // Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads.
@@ -339,12 +339,14 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     int nb256,
     int kb0,
     int nrows,
-    int size_n
+    int size_n,
+    int ncols                   // actual column count (<= 256-group span); tail warps exit
 )
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
+    if (nbp * 32 >= ncols) return;      // warp-uniform: whole 32-column pair past the slice end
     const int row_stride = size_n * 2;                              // u32 per block row at 4 bpw
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * 64 + 2 * lane;
     int c2 = (lane & 1) ? 4 : 0;
@@ -626,12 +628,14 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int nb256,
     int kb0,
     int nrows,
-    int size_n
+    int size_n,
+    int ncols                   // actual column count (<= 256-group span); tail warps exit
 )
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
+    if (nbp * 32 >= ncols) return;      // warp-uniform: whole 32-column pair past the slice end
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
     int c2 = 2 * (lane & 3);
@@ -664,7 +668,8 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     int nb256,
     int kb0,
     int nrows,
-    int size_n
+    int size_n,
+    int ncols                   // actual column count (<= 256-group span); tail warps exit
 )
 {
     constexpr int D = GEMV_STAGE_D;
@@ -673,6 +678,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
+    if (nbp * 32 >= ncols) return;      // warp-uniform: whole 32-column pair past the slice end
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
@@ -907,18 +913,19 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
     const half* __restrict__ svh,
     float* __restrict__ sh_tmp,
     int nb256,
-    int size_n
+    int size_n,
+    int n_j                     // actual column count of this matrix/slice (<= size_n); tail 128-spans exit
 )
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int row = warp >> 1;
-    if (warp >= 2 * M || row >= size_m) return;
+    int base = nb256 * 256 + (warp & 1) * 128;
+    if (warp >= 2 * M || row >= size_m || base >= n_j) return;
     float k_inv  = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
     float aff = 1024.0f * k_inv + k_bias;
 
-    int base = nb256 * 256 + (warp & 1) * 128;
     float* tmp = sh_tmp + warp * 128;
     float acc[4] = {};
     float corr = 0.0f;
@@ -937,7 +944,7 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
             suma += q2_s * (float) ((const int*) qsums)[4 * idx + 2];
             #pragma unroll
             for (int i = 0; i < 4; ++i)
-                acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
+                acc[i] += q2_s * (float) __ldcg(p + (pstride >> 1) + lane * 4 + i);
         }
         corr += aff * suma;
     }
@@ -952,13 +959,23 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 }
 
 // Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
-// x2 residual), within ~80 KB so the stage region and epilogue staging still fit under the opt-in max
+// x2 residual). RDNA3 caps dynamic shared memory at 64 KB; the B-stage region (K = 3/5/7) and the
+// epilogue staging also live in the same allocation, so the budget stays under it.
+#if defined(USE_ROCM)
+__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
+{
+    int cap = (48 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+    cap &= ~7;
+    return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
+}
+#else
 __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 {
     int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
     cap &= ~7;
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
+#endif
 
 template <int bits, int M, bool c_fp32, bool residual>
 __global__ __launch_bounds__(NUM_THREADS)
@@ -973,7 +990,8 @@ void exl3_gemv_int8_sq_kernel
     int* __restrict__ locks,
     const half* __restrict__ suh,
     half* __restrict__ A_had,
-    const half* __restrict__ svh
+    const half* __restrict__ svh,
+    const int rows_per_arg      // 0 = auto (single-wave rule); >0 = fixed slice height
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -990,6 +1008,8 @@ void exl3_gemv_int8_sq_kernel
     rows_per = MAX(rows_per, SQ_MINROWS);
     rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+    if (rows_per_arg > 0)
+        rows_per = MIN(rows_per_arg, MIN(gemv_int8_sq_rows_max(M, residual), (rows_total + 7) & ~7));
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;
@@ -1023,11 +1043,11 @@ void exl3_gemv_int8_sq_kernel
         }
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
         else if constexpr (gemv_int8_stage_smem(bits))
-            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
         else
-            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
@@ -1038,8 +1058,152 @@ void exl3_gemv_int8_sq_kernel
         if (sh_last)
         {
             gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
-                                                             C, svh, sh_tmp, nb256, size_n);
+                                                             C, svh, sh_tmp, nb256, size_n, size_n);
             if (t == 0) counters[nb256] = 0;
+        }
+    }
+}
+// ---------------------------------------------------------------------------------------------------------
+// Multi-matrix / sliced variant of the sq kernel ("msq"): one regular launch covers a whole mgemm
+// call at bszm_in == 1 (SlicedMultiLinear bundles and plain multi-matrix projections), any m.
+// Same argument list as exl3_mgemm_kernel so graph parameter recording is identical. Units are
+// (matrix-row jj = j * size_m + row, k-slice, 256-column group), claimed jj-major so a block reuses
+// its staged splats across a slice's column groups; staging is keyed by (jj, slice) with suh taken
+// from the slice's source (had_src_list) or matrix j. Counters share the sq prefix region
+// [0..SQ_COUNTERS_CAP) and are reset after use; qsums/partials live beyond SQ_WS_RESERVED like the
+// coop kernels (launches are stream-ordered, so regions never overlap in time):
+//   [counters: jj x nb256_max][sq prefix pad to SQ_WS_RESERVED][qsums: 4f x jj x ksplit][partials]
+// size_n is the max slice/matrix width (mgemm convention) and pstride is padded to it, so slice
+// widths only need to be multiples of 128 - tail warps/128-spans exit on the n_j bound.
+
+template <int bits, bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_gemv_int8_msq_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t** __restrict__ B_list,
+    void* __restrict__ C,
+    const int size_m,               // rows per matrix
+    const int size_k,
+    const int size_n,               // max slice/matrix width (mgemm convention)
+    int* __restrict__ locks,        // gemv_int8 workspace
+    const half** __restrict__ suh_list,
+    half* __restrict__ A_had,       // unused
+    const half** __restrict__ svh_list,
+    int64_t* B_indices,             // unused (host gate: no filtering)
+    half* B_weights,                // unused
+    const int bszm_in,              // == 1 (host gate)
+    const int bszm_out,             // number of matrices/slices
+    const int min_index,            // unused
+    const int max_index,            // unused
+    const int num_tokens,           // unused
+    const int* __restrict__ size_n_list,
+    void** __restrict__ C_list,
+    const int* __restrict__ n_stride_list,
+    const int* __restrict__ had_src_list,
+    const int num_had_src,
+    const int rows_per_arg          // 0 = auto (single-wave rule); >0 = fixed slice height
+)
+{
+    extern __shared__ uint32_t shmem[];
+
+    // Same decomposition rule as the sq kernel, over the max width; the host mirrors it for the
+    // shared memory size and workspace bound
+    int rows_total = size_k >> 4;
+    int nb256_max = CEIL_DIVIDE(size_n, 256);
+    int r = CEIL_DIVIDE(rows_total * nb256_max, (int) gridDim.x);
+    int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
+    rows_per = MAX(rows_per, SQ_MINROWS);
+    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(1, residual));
+    rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+    if (rows_per_arg > 0)
+        rows_per = MIN(rows_per_arg, MIN(gemv_int8_sq_rows_max(1, residual), (rows_total + 7) & ~7));
+    int ksplit = CEIL_DIVIDE(rows_total, rows_per);
+    int slice_stride = rows_per * 16;
+    int pstride = nb256_max * 256 * (residual ? 2 : 1);
+
+    int num_jj = bszm_out * size_m;
+    int* counters = locks;
+    float* qsums = (float*) (locks + SQ_WS_RESERVED);
+    int* partials = locks + SQ_WS_RESERVED + num_jj * ksplit * 4;
+
+    // Shared layout: [slice halfs][splats (+ residual splats)][B stage][epilogue tmp]
+    half* sh_ah = (half*) shmem;
+    uint32_t* sh_as = shmem + rows_per * 8;
+    uint32_t* sh_b = sh_as + slice_stride * (residual ? 2 : 1);
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    __shared__ float sh_red[33];
+    __shared__ int sh_last;
+
+    int t = threadIdx.x;
+    int prev_key = -1;
+    int jj = 0, unit_base = 0, ctr_base = 0;
+    int j = 0, row = 0;
+    int n_j = size_n_list ? size_n_list[0] : size_n;
+    int nb256_j = CEIL_DIVIDE(n_j, 256);
+    int units_jj = nb256_j * ksplit;
+
+    for (int unit = blockIdx.x; ; unit += gridDim.x)
+    {
+        while (unit >= unit_base + units_jj)
+        {
+            unit_base += units_jj;
+            ctr_base += nb256_j;
+            if (++jj >= num_jj) return;
+            j = jj / size_m;
+            row = jj % size_m;
+            n_j = size_n_list ? size_n_list[j] : size_n;
+            nb256_j = CEIL_DIVIDE(n_j, 256);
+            units_jj = nb256_j * ksplit;
+        }
+        int u = unit - unit_base;
+        int slice = u / nb256_j;
+        int nb256 = u % nb256_j;
+        int kb0 = slice * rows_per;
+        int nrows = MIN(rows_per, rows_total - kb0);
+
+        int key = jj * ksplit + slice;
+        if (key != prev_key)
+        {
+            const half* suh_j = suh_list[had_src_list ? had_src_list[j] : j];
+            gemv_int8_stage_slice<1, residual>(A + (size_t) row * size_k, 1, size_k, suh_j,
+                                               qsums + 4 * key,
+                                               sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
+            prev_key = key;
+        }
+
+        const uint16_t* B_j = B_list[j];
+        int n_stride_j = n_stride_list ? n_stride_list[j] : n_j;
+        int* pacc = partials + (size_t) key * pstride;
+        if constexpr (bits == 4)
+            gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
+        else if constexpr (gemv_int8_stage_smem(bits))
+            gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_stride_j, n_j);
+        else
+            gemv_int8_unit_narrow<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
+
+        // Per-(matrix,row) completion counter: the ksplit-th contributor runs the epilogue for
+        // this 256-column group of output row `row` of matrix j
+        __threadfence();
+        __syncthreads();
+        if (t == 0) sh_last = (atomicAdd(&counters[ctr_base + nb256], 1) == ksplit - 1) ? 1 : 0;
+        __syncthreads();
+        if (sh_last)
+        {
+            void* C_j;
+            if (C_list)
+                // sliced outputs are column ranges of (m, n_stride_j) source tensors
+                C_j = c_fp32 ? (void*) (((float*) C_list[j]) + (size_t) row * n_stride_j)
+                             : (void*) (((half*)  C_list[j]) + (size_t) row * n_stride_j);
+            else
+                C_j = c_fp32 ? (void*) (((float*) C) + ((size_t) j * size_m + row) * size_n)
+                             : (void*) (((half*)  C) + ((size_t) j * size_m + row) * size_n);
+            gemv_int8_epilogue_group_sq<1, c_fp32, residual>(
+                partials + (size_t) jj * ksplit * pstride,
+                qsums + 4 * jj * ksplit, pstride, ksplit,
+                1, C_j, svh_list[j], sh_tmp,
+                nb256, size_n, n_j);
+            if (t == 0) counters[ctr_base + nb256] = 0;
         }
     }
 }
@@ -1210,11 +1374,11 @@ void exl3_gemv_int8_coop_kernel
                 prev_slice = slice;
             }
             if constexpr (bits == 4)
-                gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
             else if constexpr (gemv_int8_stage_smem(bits))
-                gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n, size_n);
             else
-                gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
         }
         grid.sync();
 

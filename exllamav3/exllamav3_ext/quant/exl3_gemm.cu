@@ -534,6 +534,23 @@ int exl3_mgemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // Multi-matrix/sliced fast path: one regular launch covers the whole call (sliced
+    // SlicedMultiLinear bundles and plain multi-matrix projections), any m - rows are flattened
+    // into the unit index. No filtering/reduction; MoE-style per-matrix inputs (bszm_in > 1)
+    // stay on the coop kernel.
+    if (mul1 && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() && bszm_in == 1 &&
+        min_index < 0 && !indices && !weights && num_tokens == 1 &&
+        force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        if (exl3_gemv_int8_msq(
+            A_ptr, B_ptr_ptr, C_ptr, size_m, size_k, size_n,
+            suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr, bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr, n_stride_list_ptr, had_src_list_ptr, num_had_src,
+            K, c_fp32, device, num_sms, stream, graph))
+            return 0;
+    }
+
     int shape_idx;
     int block_dim;
     fp_exl3_mgemm_kernel kernel;

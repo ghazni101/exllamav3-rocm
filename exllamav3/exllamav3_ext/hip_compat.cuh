@@ -239,10 +239,14 @@ __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
     __builtin_nontemporal_store(v, p);
 }
 
-// NOTE: no stg_wt_u128 here. The CUDA original is a single st.global.wt.v4.u32; the only
-// faithful HIP emulation would be four nontemporal stores, which is not single-copy
-// atomic. Nothing uses it; add it back only for consumers that don't pack flag+data in
-// one 128-bit word.
+__device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
+{
+    // Single 128-bit nontemporal store via vector reinterpret. One instruction, but
+    // single-copy atomicity is not guaranteed the way PTX st.global.wt.v4.u32 is;
+    // do not use for flag+data packed words.
+    typedef int __attribute__((ext_vector_type(4))) int4_v;
+    *reinterpret_cast<int4_v*>(p) = *reinterpret_cast<const int4_v*>(&v);
+}
 
 __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 {
