@@ -12,7 +12,7 @@
 #include "hadamard_inner.cuh"
 #include <cooperative_groups.h>
 #include <cstdlib>
-#include <set>
+#include <cstdint>
 #include <map>
 
 
@@ -32,6 +32,14 @@ static int exl3_gemv_int8_mode()
 bool exl3_gemv_int8_enabled()
 {
     return exl3_gemv_int8_mode() != 0;
+}
+
+// Kill switch for the multi-matrix/sliced path only (EXL3_INT8_MSQ=0), for A/B verification
+// against the cooperative mgemm kernel on identical inputs
+bool exl3_gemv_int8_msq_enabled()
+{
+    static const int on = [] { const char* e = getenv("EXL3_INT8_MSQ"); return e ? atoi(e) : 1; }();
+    return on != 0;
 }
 
 // Highest K the int8 path accepts; above it the regular kernel wins. The fp16 pipeline must be
@@ -94,6 +102,22 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
     return nullptr;
 }
 
+static void* select_gemv_int8_msq_kernel(int K, bool c_fp32, bool residual)
+{
+    switch (K)
+    {
+        case 1: return exl3_gemv_int8_msq_sel_k1(c_fp32, residual);
+        case 2: return exl3_gemv_int8_msq_sel_k2(c_fp32, residual);
+        case 3: return exl3_gemv_int8_msq_sel_k3(c_fp32, residual);
+        case 4: return exl3_gemv_int8_msq_sel_k4(c_fp32, residual);
+        case 5: return exl3_gemv_int8_msq_sel_k5(c_fp32, residual);
+        case 6: return exl3_gemv_int8_msq_sel_k6(c_fp32, residual);
+        case 7: return exl3_gemv_int8_msq_sel_k7(c_fp32, residual);
+        case 8: return exl3_gemv_int8_msq_sel_k8(c_fp32, residual);
+    }
+    return nullptr;
+}
+
 // Fixed-size per-device workspace shared by the sq and coop paths, allocated once and never
 // reallocated: the pointer is baked as a kernel argument into captured CUDA graphs, so growing the
 // buffer would leave every previously captured graph with a dangling workspace pointer (and let a
@@ -124,12 +148,26 @@ static bool exl3_gemv_int8_sq
     int device, int num_sms, cudaStream_t stream, Graph* graph
 )
 {
-    if (size_m > 2) return false;
-    int M = size_m;
+    if (size_m > 4) return false;
+    int M = size_m > 2 ? 4 : size_m;
     void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
     if (!fn) return false;
 
     int rows_max = gemv_int8_sq_rows_max(M, residual);
+
+    // EXL3_SQ_ROWS_PER pins the slice height (multiple of 8, >= SQ_MINROWS). On RDNA3 the
+    // single-wave rule's rows_per = rows_max starves occupancy on wide matrices (lm_head):
+    // swept on gfx1101, 64 beats auto by ~19% decode e2e (32/48/96/128/256 all slower).
+    static const int rows_per_env = []
+    {
+        const char* e = getenv("EXL3_SQ_ROWS_PER");
+        return e ? atoi(e) : 0;
+    }();
+#if defined(USE_ROCM)
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 64) + 7) & ~7, SQ_MINROWS);
+#else
+    int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
+#endif
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -141,6 +179,8 @@ static bool exl3_gemv_int8_sq
         rows_per = MAX(rows_per, SQ_MINROWS);
         rows_per = MIN(rows_per, rows_max);
         rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+        if (rows_per_arg > 0)
+            rows_per = MIN(rows_per_arg, MIN(rows_max, (rows_total + 7) & ~7));
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
     };
     auto smem_for = [&] (int rows_per) -> size_t
@@ -152,7 +192,6 @@ static bool exl3_gemv_int8_sq
 
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
-#if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
 #if !defined(USE_ROCM)
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
@@ -200,7 +239,8 @@ static bool exl3_gemv_int8_sq
         (void*) &ws_ptr,
         (void*) &suh_ptr,
         (void*) &A_had_ptr,
-        (void*) &svh_ptr
+        (void*) &svh_ptr,
+        (void*) &rows_per_arg
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
@@ -218,6 +258,174 @@ static bool exl3_gemv_int8_sq
         graph->record_param(fn, GP_gemm_B_suh, 7);
         graph->record_param(fn, GP_gemm_A_had, 8);
         graph->record_param(fn, GP_gemm_B_svh, 9);
+        graph->record_param(fn, GP_end, 0);
+    }
+    return true;
+}
+
+// m == 1 multi-matrix/sliced fast path: per-slice-scale kernel covering a whole mgemm call in one
+// regular launch (see exl3_gemv_int8_msq_kernel). Takes the mgemm entry's cooked pointer arguments;
+// the kernel signature matches exl3_mgemm_kernel so graph parameter recording is identical.
+// Returns false to fall through to the cooperative mgemm kernel. Unlike the single-matrix gate,
+// every K is accepted: the alternative here is the cooperative mgemm kernel, which loses to this
+// path even at K = 7-8.
+bool exl3_gemv_int8_msq
+(
+    const half* A_ptr,
+    const uintptr_t* B_ptr_ptr,
+    void* C_ptr,
+    int size_m,
+    int size_k,
+    int size_n,                     // max slice/matrix width
+    const uintptr_t* suh_ptr_ptr,
+    half* A_had_ptr,
+    const uintptr_t* svh_ptr_ptr,
+    const int64_t* indices_ptr,
+    const half* weights_ptr,
+    int bszm_in,
+    int bszm_out,
+    int min_index,
+    int max_index,
+    int num_tokens,
+    const int* size_n_list_ptr,
+    void** c_list_ptr,
+    const int* n_stride_list_ptr,
+    const int* had_src_list_ptr,
+    int num_had_src,
+    int K,
+    bool c_fp32,
+    int device,
+    int num_sms,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    if (size_m < 1 || bszm_out < 1) return false;
+    bool residual = exl3_gemv_int8_mode() == 1;
+    void* fn = select_gemv_int8_msq_kernel(K, c_fp32, residual);
+    if (!fn) return false;
+
+    int rows_total = size_k / 16;
+    int nb256_max = CEIL_DIVIDE(size_n, 256);
+    int rows_max = gemv_int8_sq_rows_max(1, residual);
+
+    // Mirror of the kernel's work decomposition (sq's single-wave rule over the max width);
+    // EXL3_SQ_ROWS_PER pins the slice height (default 64 on RDNA3 — swept on gfx1101)
+    static const int rows_per_env = []
+    {
+        const char* e = getenv("EXL3_SQ_ROWS_PER");
+        return e ? atoi(e) : 0;
+    }();
+#if defined(USE_ROCM)
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 64) + 7) & ~7, SQ_MINROWS);
+#else
+    int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
+#endif
+    auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
+    {
+        int r = CEIL_DIVIDE(rows_total * nb256_max, grid_);
+        rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
+        rows_per = MAX(rows_per, SQ_MINROWS);
+        rows_per = MIN(rows_per, rows_max);
+        rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+        if (rows_per_arg > 0)
+            rows_per = MIN(rows_per_arg, MIN(rows_max, (rows_total + 7) & ~7));
+        ksplit = CEIL_DIVIDE(rows_total, rows_per);
+    };
+    auto smem_for = [&] (int rows_per) -> size_t
+    {
+        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * (residual ? 2 : 1)
+               + stage + (size_t) 2 * 128 * 4;
+    };
+
+    if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
+    {
+        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
+#if !defined(USE_ROCM)
+        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+#endif
+        gemv_attr_set[device].insert(fn);
+        cuda_check(cudaPeekAtLastError());
+    }
+
+    int ksplit, rows_per;
+    decomp(6 * num_sms, ksplit, rows_per);
+    size_t smem_guess = smem_for(rows_per);
+    int maxb;
+    auto occ_key = std::make_pair(fn, smem_guess);
+    auto occ_it = gemv_occ_cache[device].find(occ_key);
+    if (occ_it != gemv_occ_cache[device].end()) maxb = occ_it->second;
+    else
+    {
+        maxb = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
+        gemv_occ_cache[device][occ_key] = maxb;
+    }
+    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    decomp(grid, ksplit, rows_per);
+    size_t smem = smem_for(rows_per);
+
+    // Workspace: counters share the sq prefix [0..SQ_COUNTERS_CAP); qsums/partials live beyond
+    // SQ_WS_RESERVED like the coop kernels. If it doesn't fit, grow rows_per (fewer slices ->
+    // less workspace) up to rows_max, then pin the kernel to the same slice height.
+    int num_jj = bszm_out * size_m;
+    if (num_jj * nb256_max > SQ_COUNTERS_CAP) return false;
+    int pstride = nb256_max * 256 * (residual ? 2 : 1);
+    int* ws_ptr = nullptr;
+    while (true)
+    {
+        size_t ws_ints = SQ_WS_RESERVED
+                       + (size_t) num_jj * ksplit * 4
+                       + (size_t) num_jj * ksplit * pstride;
+        ws_ptr = gemv_int8_get_ws(device, ws_ints);
+        if (ws_ptr) break;
+        if (rows_per >= rows_max) return false;
+        rows_per = MIN(rows_per * 2, MIN(rows_max, (rows_total + 7) & ~7));
+        ksplit = CEIL_DIVIDE(rows_total, rows_per);
+        smem = smem_for(rows_per);
+    }
+    rows_per_arg = rows_per;    // pin the kernel to the (possibly grown) slice height
+    void* kernelArgs[] =
+    {
+        (void*) &A_ptr,
+        (void*) &B_ptr_ptr,
+        (void*) &C_ptr,
+        (void*) &size_m,
+        (void*) &size_k,
+        (void*) &size_n,
+        (void*) &ws_ptr,
+        (void*) &suh_ptr_ptr,
+        (void*) &A_had_ptr,
+        (void*) &svh_ptr_ptr,
+        (void*) &indices_ptr,
+        (void*) &weights_ptr,
+        (void*) &bszm_in,
+        (void*) &bszm_out,
+        (void*) &min_index,
+        (void*) &max_index,
+        (void*) &num_tokens,
+        (void*) &size_n_list_ptr,
+        (void*) &c_list_ptr,
+        (void*) &n_stride_list_ptr,
+        (void*) &had_src_list_ptr,
+        (void*) &num_had_src,
+        (void*) &rows_per_arg
+    };
+
+    cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
+    if (err != cudaSuccess)
+    {
+        // Nothing was captured: the caller's fallback kernel records its own parameter sites
+        cudaGetLastError();
+        return false;
+    }
+    if (graph)
+    {
+        graph->record_param(fn, GP_mgemm_A, 0);
+        graph->record_param(fn, GP_mgemm_C, 2);
+        graph->record_param(fn, GP_mgemm_indices, 10);
+        graph->record_param(fn, GP_mgemm_weights, 11);
         graph->record_param(fn, GP_end, 0);
     }
     return true;
@@ -251,11 +459,10 @@ bool exl3_gemv_int8
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
 
-    // Per-slice-scale kernel: m == 1, plus m == 2 in plain int8 mode (rows share the decoded
-    // weights and the B stream; measured on 3090, larger m and batched residual lose to the fp16
-    // tensor-core kernel). Falls through to the cooperative kernel on a constraint miss at m == 1;
-    // batched rows beyond the gate go straight to the regular kernel.
-    if (size_m <= (residual ? 1 : 2) && exl3_gemv_int8_sq(
+    // Per-slice-scale kernel: m <= 4 in plain int8 mode (rows share the decoded weights and the B
+    // stream). Falls through to the cooperative kernel on a constraint miss; batched rows beyond
+    // the gate go straight to the regular kernel.
+    if (size_m <= (residual ? 1 : 4) && exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
         size_m, size_k, size_n, K, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
@@ -284,7 +491,6 @@ bool exl3_gemv_int8
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
-#if !defined(USE_ROCM)
         cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
 #if !defined(USE_ROCM)
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with

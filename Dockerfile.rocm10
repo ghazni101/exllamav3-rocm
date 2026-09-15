@@ -38,7 +38,7 @@ WORKDIR /opt/exllamav3
 COPY . /opt/exllamav3
 # Non-editable install forces the C++/HIP extension to compile at build time.
 # --no-deps keeps pip from replacing the ROCm torch wheel with the CUDA one.
-RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} MAX_JOBS=16 \
+RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} MAX_JOBS=8 \
     /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -5
 
 ENV EXL3_MODEL=/models/qwen38-27b
