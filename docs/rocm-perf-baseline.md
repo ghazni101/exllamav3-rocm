@@ -171,6 +171,8 @@ P4 — serving-level throughput:
 |---|---|---|---|
 | baseline rocm-port (EXL3_INT8_GEMV default=2) | 6.0 | 431 | |
 | EXL3_INT8_GEMV=0 (QTIP GEMV engaged) | 1.7 | — | GEMV worse on RDNA; grid-starved |
+| rocm-port + fixes (carveout, atomics, soname) | 6.1 | 430 | correctness pass; no perf delta expected |
+| + coop autotuner at concurrency=1 + hw dp4a | 11.9 | 429 | batch8 16.6 → 20.3 t/s (warmed); concurrency>1 still deadlocks on RDNA |
 
 ## Reproducing
 
