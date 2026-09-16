@@ -483,3 +483,97 @@ profiling/run_attach_serve.sh 90000 # attach-profile the live serve under HTTP l
 4. Re-run the full CLI profile of the model (decode + prefill) and reconcile with the committed
    analysis in `docs/rocm-perf-gfx1100-tg-pp-plan.md`, correcting any number that was inferred.
 5. Report the gpu-coord detection gap (§5) to the developer.
+
+---
+
+## 10. Session 3: plan execution — TTFT wins shipped, both kernel routes resolved
+
+Date: 2026-09-16 evening. Branch: `rocm-perf` (off `rocm-port`). User scope decision: skip MTP,
+focus on auto-regressive (decode/tg) speed.
+
+### 10.1 Image provenance trap — know which image you are measuring
+
+`exllamav3-rocm:serve` (the base) carries an extension .so built **Sep 14** — *before* the
+`msq m>1 / sq m<=4` tuning landed (`28f29ee`, Sep 16 01:02). The deployed overlay
+`tabbyapi-rocm:serve` carries the tuned extension (built Sep 16 11:48; its 705 MB layer
+includes the exl3 pip install). Bench discrepancy that exposed it, fully reproducible:
+
+| metric (bench_lean) | on stale base | on deployed overlay |
+|---|---|---|
+| decode b1 | 13.7 tok/s | **29.0** |
+| batch4 aggregate | 13.1 | **31.7** |
+| batch8 aggregate | 24.9 | **28.6** |
+| prefill 2k | 324 | 342 (unchanged — reconstruct path identical) |
+
+**Rule: any bench or gate run against `exllamav3-rocm:serve` is invalid for perf; build perf
+images `FROM tabbyapi-rocm:serve` (see `profiling/Dockerfile.perf`).**
+
+True deployed baselines (2026-09-16 18:2x, bench_lean): b1 29.01, batch4 31.67, batch8 28.62,
+prefill-2k 342.4, load 83.5 s. Golden-token baseline for the deployed build:
+`profiling/out_exec3/golden_tabbyapi.json` (8 prompts × 256 greedy tokens, includes a 4k-ctx
+and two shared-prefix prompts).
+
+### 10.2 pp-0 answered: the GEMM library is not the prefill bottleneck
+
+`profiling/gemm_probe2.py` times both device paths on the model's exact (k, n) inventory
+(51.2 GFLOP/token of prefill GEMMs, from checkpoint headers):
+
+| m | torch.matmul | ext.hgemm_recon (what the model calls) |
+|---|---|---|
+| 512 | 72.5 TF/s | 91.6 TF/s |
+| 1700 | 75.5 TF/s | 90.2 TF/s |
+| 2048 | 74.5 TF/s | 93.1 TF/s |
+| 4096 | 75.8 TF/s | 100.4 TF/s |
+
+`hgemm_recon` in a clean loop runs at 3× the throughput the model achieves in-prefill
+(~30 TF/s from the live-serve trace) on identical shapes. The gap is therefore call *context*:
+the model allocates a fresh fp16 weight/output buffer per linear per chunk (`exl3.py:193/222`),
+serializes reconstruct→GEMM per linear, and orchestrates ~450 calls from Python. When pp work
+resumes, pp-1.2 (persistent scratch — makes the model match the probe's buffer-reuse condition)
+and pp-1.3 (C++ driver) are the justified moves; pp-0 (algo/workspace hunt) is closed as
+not-the-problem.
+
+### 10.3 tg-1a: dead, hardware limit (documented at the patch site)
+
+Doubling the cooperative grid on RDNA3 (`multiProcessorCount` = WGP count; 48 WGPs → 96 CUs)
+asserts at launch: **"too many blocks in cooperative launch"** — the coop kernel (512 threads,
+184+ VGPRs) cannot co-reside 96 blocks on 96 CUs. Not a reporting bug; the grid cannot be
+widened without shrinking the block footprint. Reverted; the comment at `exl3_gemm.cu` keeps
+the evidence. Batch decode must therefore be fixed with regular-launch kernels.
+
+### 10.4 tg-1b: attempted, reverted — deadlock in a never-exercised kernel configuration
+
+The msq kernel's work units already flatten (matrix × row), the had forms are prepared by the
+caller, all model (k, n) pass its constraints, and `num_tokens` is unused in plain mode — so
+routing single-matrix m>4 to `exl3_gemv_int8_msq` (patch `49e89f7`, image
+`exllamav3-rocm:perf-tg1b`) looked safe. In the gate run the generator **deadlocked** on the
+first 14-token prefill (the first-ever `bszm=1 × m>1` msq call): GPU idle, all 89 host threads
+asleep. The kernel's validated coverage is m=1 with multiple matrices (`test_msq_ab.py`);
+`bszm=1, m>1` was never exercised.
+
+Follow-ups, in order:
+1. Standalone kernel A/B for `bszm=1, m ∈ {5..16}` vs per-row sq (outside the generator), with
+   `--cap-add=SYS_PTRACE` + py-spy/gdb in the container so a hang is debuggable.
+2. Correctness-gate redesign for this change: **msq is not bit-exact vs sq/coop by design**
+   (per-slice vs global activation scales — see the `test_msq_ab.py` header), so routing
+   prefill m∈5..144 through it changes numerics; the token-exact golden gate must become
+   "identical tokens on unchanged paths (m≤4, reconstruct) + KLD/tolerance on the m>4 prefill
+   prompts" for exactly those runs.
+3. Re-land with the G2 batch gate at m=8 (`correctness_gate.py batch` now runs 8 prompts).
+
+### 10.5 Shipped: TTFT quick wins (no kernel change)
+
+- `warmup.py` + compose entrypoint wrapper (short decode + 2k prefill at boot) and
+  `sampling.override_preset: safe_defaults` in `config.yml` (backup: `config.yml.bak-*`).
+- Verified over HTTP after redeploy: **first-request TTFT 7.58 s → 1.36 s (−82 %)**; decode
+  256-token 27.9 tok/s, cold 1.7 k TTFT 3.42 s, warm prefix 0.58 s — all unchanged, as
+  expected from a no-op-to-kernels change.
+
+### 10.6 State at end of session
+
+- Standing serve: running, warmed at boot, `tabbyapi-rocm:serve` (unchanged extension).
+- Branch `rocm-perf`: tg-1a/tg-1b reverted with documentation; correctness/bench harness
+  extended; golden baseline committed (`out_exec3/golden_tabbyapi.json`).
+- Images: `exllamav3-rocm:perf-tg1a` / `perf-tg1b` exist as artifacts (do not promote);
+  `Dockerfile.perf` is pinned to the correct base for the next attempt.
+- Decode (tg) next lever remains tg-1b done right (§10.4 list), then tg-2 GEMV efficiency.

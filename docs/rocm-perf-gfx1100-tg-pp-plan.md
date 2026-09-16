@@ -458,6 +458,30 @@ is 1–3 ms/step, not 8–12; do these only after tg-1/tg-2, and expect single-d
 
 ---
 
+---
+
+## 8. Execution status (session 3, same day — updated targets)
+
+Scope decision: MTP/spec-decode skipped for now; focus on auto-regressive (decode/tg) speed.
+
+| item | status |
+|---|---|
+| TTFT-0 warmup + TTFT-4 preset | **SHIPPED** — first-request TTFT 7.58 → 1.36 s; verified over HTTP |
+| P0 correctness gates | **BUILT** — `profiling/correctness_gate.py` (golden baseline committed), `soak.py`, batch gate at m=8 |
+| pp-0 | **ANSWERED (negative)** — `hgemm_recon` runs 90–100 TF/s clean-loop on the exact shapes; in-model ~30 TF/s is call context (buffer churn, serialization). pp-1.2/1.3 justified when pp resumes (deferred) |
+| tg-1a (coop grid ×2) | **DEAD — hardware**: co-residency assert at 96 blocks; documented at patch site |
+| tg-1b (msq for m>4) | **ATTEMPTED, REVERTED** — generator deadlock in `bszm=1, m>1` (never-exercised config); follow-ups in findings-log §10.4 |
+| tg-2 (GEMV efficiency) | open; unchanged |
+
+Reference baselines on the deployed overlay (bench_lean): b1 29.0 / batch4 31.7 / batch8 28.6
+tok/s aggregate, prefill-2k 342 tok/s. Image provenance rule: build from `tabbyapi-rocm:serve`,
+never from the stale `exllamav3-rocm:serve` base (findings-log §10.1).
+
+The §5 plan items and §6 correctness gates stand; gate 1 needs the numeric-change variant
+(KLD + tolerance) whenever a change intentionally touches prefill numerics (findings-log §10.4).
+
+---
+
 ## 6. Correctness and verification gates
 
 Every P0–P6 change must clear these. Greedy decoding is deterministic, so most of this is exact
