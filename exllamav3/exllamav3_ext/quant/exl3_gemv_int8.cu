@@ -118,6 +118,12 @@ static void* select_gemv_int8_msq_kernel(int K, bool c_fp32, bool residual)
     return nullptr;
 }
 
+static bool dbg_gemv_enabled()
+{
+    static const bool on = [] { const char* e = getenv("EXL3_DBG_GEMV"); return e && atoi(e); }();
+    return on;
+}
+
 // Fixed-size per-device workspace shared by the sq and coop paths, allocated once and never
 // reallocated: the pointer is baked as a kernel argument into captured CUDA graphs, so growing the
 // buffer would leave every previously captured graph with a dangling workspace pointer (and let a
@@ -151,7 +157,13 @@ static bool exl3_gemv_int8_sq
     if (size_m > 4) return false;
     int M = size_m > 2 ? 4 : size_m;
     void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
-    if (!fn) return false;
+    if (!fn)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_sq] no kernel: m=%d k=%d n=%d K=%d c_fp32=%d res=%d\n",
+                    size_m, size_k, size_n, K, (int) c_fp32, (int) residual);
+        return false;
+    }
 
     int rows_max = gemv_int8_sq_rows_max(M, residual);
 
@@ -221,12 +233,27 @@ static bool exl3_gemv_int8_sq
     int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
-    if (ksplit > SQ_KSPLIT_CAP) return false;
-    if (size_n / 256 > SQ_COUNTERS_CAP) return false;
+    if (ksplit > SQ_KSPLIT_CAP)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_sq] ksplit cap: ksplit=%d k=%d n=%d K=%d\n", ksplit, size_k, size_n, K);
+        return false;
+    }
+    if (size_n / 256 > SQ_COUNTERS_CAP)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_sq] counters cap: n=%d\n", size_n);
+        return false;
+    }
 
     int pstride = size_n * (residual ? 2 : 1);
     int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * M * pstride);
-    if (!ws_ptr) return false;
+    if (!ws_ptr)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_sq] ws: k=%d n=%d K=%d\n", size_k, size_n, K);
+        return false;
+    }
 
     void* kernelArgs[] =
     {
@@ -303,7 +330,13 @@ bool exl3_gemv_int8_msq
     if (size_m < 1 || bszm_out < 1) return false;
     bool residual = exl3_gemv_int8_mode() == 1;
     void* fn = select_gemv_int8_msq_kernel(K, c_fp32, residual);
-    if (!fn) return false;
+    if (!fn)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_msq] no kernel: m=%d k=%d n=%d K=%d c_fp32=%d\n",
+                    size_m, size_k, size_n, K, (int) c_fp32);
+        return false;
+    }
 
     int rows_total = size_k / 16;
     int nb256_max = CEIL_DIVIDE(size_n, 256);
@@ -370,7 +403,13 @@ bool exl3_gemv_int8_msq
     // SQ_WS_RESERVED like the coop kernels. If it doesn't fit, grow rows_per (fewer slices ->
     // less workspace) up to rows_max, then pin the kernel to the same slice height.
     int num_jj = bszm_out * size_m;
-    if (num_jj * nb256_max > SQ_COUNTERS_CAP) return false;
+    if (num_jj * nb256_max > SQ_COUNTERS_CAP)
+    {
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_msq] counters cap: jj=%d nb256=%d m=%d n=%d\n",
+                    num_jj, nb256_max, size_m, size_n);
+        return false;
+    }
     int pstride = nb256_max * 256 * (residual ? 2 : 1);
     int* ws_ptr = nullptr;
     while (true)
@@ -380,7 +419,12 @@ bool exl3_gemv_int8_msq
                        + (size_t) num_jj * ksplit * pstride;
         ws_ptr = gemv_int8_get_ws(device, ws_ints);
         if (ws_ptr) break;
-        if (rows_per >= rows_max) return false;
+        if (rows_per >= rows_max)
+        {
+            if (dbg_gemv_enabled())
+                fprintf(stderr, "[exl3_msq] ws: jj=%d ksplit=%d rows_per=%d\n", num_jj, ksplit, rows_per);
+            return false;
+        }
         rows_per = MIN(rows_per * 2, MIN(rows_max, (rows_total + 7) & ~7));
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
         smem = smem_for(rows_per);
@@ -445,16 +489,28 @@ bool exl3_gemv_int8
 {
     if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
 
+    // Diagnostics for the single-matrix fast path: every fall-through to the cooperative
+    // kernel is grid-starved on RDNA, so EXL3_DBG_GEMV=1 logs why each call missed the
+    // sq/coop-int8 paths (zero cost when unset)
+    static const bool dbg_gemv = dbg_gemv_enabled();
+    auto dbg = [&] (const char* why)
+    {
+        if (dbg_gemv)
+            fprintf(stderr, "[exl3_gemv_int8] miss (%s): m=%d k=%d n=%d K=%d c_fp32=%d\n",
+                    why, (int) (A.numel() / A.size(-1)), A.size(-1), B.size(1) * 16, B.size(2) / 16,
+                    (int) (C.dtype() == at::kFloat));
+    };
+
     int K = B.size(2) / 16;
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
     int size_m = A.numel() / size_k;
-    if (size_n % 256) return false;
-    if (size_k % 128) return false;
+    if (size_n % 256) { dbg("n %% 256"); return false; }
+    if (size_k % 128) { dbg("k %% 128"); return false; }
 
     int device;
     cudaGetDevice(&device);
-    if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
+    if (K < 1 || K > exl3_gemv_int8_max_k(device)) { dbg("K range"); return false; }
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
@@ -468,10 +524,10 @@ bool exl3_gemv_int8
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
         device, num_sms, stream, graph))
         return true;
-    if (size_m > 1) return false;
+    if (size_m > 1) { dbg("m>1 after sq"); return false; }
 
     void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
-    if (!fn) return false;
+    if (!fn) { dbg("no coop int8 kernel"); return false; }
 
     // Mirror the kernel's work decomposition for the shared memory size; grid = max co-resident
     // blocks (natural register allocation measures faster than forcing higher occupancy)
@@ -525,7 +581,7 @@ bool exl3_gemv_int8
     // Coop region beyond the sq-reserved prefix: [2n accs][4m qsums][grid partial maxes]
     size_t ws_ints = SQ_WS_RESERVED + (size_t) 2 * size_n + 4 * size_m + 1024;
     int* ws_base = gemv_int8_get_ws(device, ws_ints);
-    if (!ws_base) return false;
+    if (!ws_base) { dbg("ws"); return false; }
     int* ws_ptr = ws_base + SQ_WS_RESERVED;
 
     const half* A_ptr = (const half*) A.data_ptr();
@@ -568,6 +624,9 @@ bool exl3_gemv_int8
     {
         // e.g. cooperative launch unsupported or co-residency violated: fall back to the regular kernel
         // (which records its own graph parameter sites)
+        if (dbg_gemv_enabled())
+            fprintf(stderr, "[exl3_coopint8] launch failed: %s k=%d n=%d K=%d\n",
+                    cudaGetErrorString(err), size_k, size_n, K);
         cudaGetLastError();
         return false;
     }

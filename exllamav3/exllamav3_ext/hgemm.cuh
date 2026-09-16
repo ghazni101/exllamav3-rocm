@@ -33,3 +33,9 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c);
 int hgemm_f16acc_status(int device);
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c);
+
+// ROCm only (hgemm.cu): fp16-in/fp32-out GEMM through hipBLASLt with heuristic algo caching.
+// Returns false (caller falls back) when the shape/algo is unsupported.
+#if defined(USE_ROCM)
+bool hgemm_lt_f32out(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream);
+#endif

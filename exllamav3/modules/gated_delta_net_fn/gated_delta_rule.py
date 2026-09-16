@@ -117,11 +117,14 @@ def gated_delta_rule_fn(
             k = k.view(bsz, seqlen, -1, k_head_dim)
             v = v.view(bsz, seqlen, -1, v_head_dim)
 
+            # Default slots are 0..bsz-1; keep them host-side so the per-layer loop doesn't
+            # force a D2H sync (the device arange + tolist() drained the whole async queue
+            # once per GDN layer per chunked forward and dominated prefill wall time)
             recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
             if recurrent_slots_cpu is None:
-                recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+                recurrent_slots_cpu = range(bsz)
             core_attn_out = []
-            for i, s in enumerate(recurrent_slots_cpu.tolist()):
+            for i, s in enumerate(recurrent_slots_cpu):
                 state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
                 core_attn, new_state = chunk_kda(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1],
@@ -172,11 +175,12 @@ def gated_delta_rule_fn(
         v = v.view(bsz, seqlen, -1, v_head_dim)
 
         # (Grouped attn supported in fla-core now)
+        # Host-side default slots (see the KDA branch above): avoids a D2H sync per layer
         recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
         if recurrent_slots_cpu is None:
-            recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+            recurrent_slots_cpu = range(bsz)
         core_attn_out = []
-        for i, s in enumerate(recurrent_slots_cpu.tolist()):
+        for i, s in enumerate(recurrent_slots_cpu):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = chunk_gated_delta_rule(
                 q[i:i + 1], k[i:i + 1], v[i:i + 1],

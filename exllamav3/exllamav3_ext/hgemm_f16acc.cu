@@ -14,6 +14,7 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/mm.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -552,9 +553,31 @@ int hgemm_f16acc_status(int device)
 #endif
 }
 
-// Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
+// Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS.
+// On ROCm, cublasGemmEx (hipBLAS -> rocBLAS) picks a poor solution for the large-M shapes
+// this path serves: 2048x17408x5120 fp16 runs 41 ms via GemmEx vs 9 ms through the
+// hipBLASLt backend torch.mm routes to on gfx1101 (measured). fp16 output goes through
+// torch's mm (one extra output-sized device copy, ~0.1 ms at these shapes); fp32 output
+// (torch can't mix dtypes) goes through a direct hipBLASLt call. Both fall back to
+// GemmEx on anything unusual. This path never runs under graph capture.
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
 {
     if (hgemm_f16acc_try(a, b, c)) return;
+#if defined(USE_ROCM)
+    if (a.dim() == 2 && b.dim() == 2 && c.dim() == 2 &&
+        a.is_contiguous() && b.is_contiguous() && c.is_contiguous())
+    {
+        if (c.dtype() == at::kHalf)
+        {
+            c.copy_(at::mm(a, b));
+            return;
+        }
+        if (c.dtype() == at::kFloat)
+        {
+            if (hgemm_lt_f32out(a, b, c, at::cuda::getCurrentCUDAStream().stream()))
+                return;
+        }
+    }
+#endif
     hgemm(a, b, c);
 }

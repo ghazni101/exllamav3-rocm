@@ -139,8 +139,8 @@ else:
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
     elif is_hip:
-        # The extension calls hipBLAS directly (hgemm.cu, graph.cu); link it explicitly
-        extra_ldflags += ["-lhipblas"]
+        # The extension calls hipBLAS and hipBLASLt directly (hgemm.cu, graph.cu); link both
+        extra_ldflags += ["-lhipblas", "-lhipblaslt"]
 
     # sources
 

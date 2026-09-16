@@ -17,7 +17,7 @@
 # is sliced offline by timestamp, after the warmup generation.
 set -euo pipefail
 
-OUT=${OUT:-/tmp/rocmprof}
+OUT=${OUT:-/tmp/rocmprof/run-$(date +%Y%m%d-%H%M%S)}
 MODE=${1:-kernel}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$OUT"

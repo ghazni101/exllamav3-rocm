@@ -164,3 +164,166 @@ void hgemm_batched
     cublas_check(r);
     cuda_check(cudaPeekAtLastError());
 }
+
+#if defined(USE_ROCM)
+#include <hipblaslt/hipblaslt.h>
+#include <map>
+#include <mutex>
+
+// rocBLAS (via cublasGemmEx) picks a poor kernel for the fp16-in/fp32-out GEMMs of the
+// reconstruct (prefill) path on RDNA3: 11.8 ms average for the 2k-token prefill's
+// projections vs 3.4 ms through the hipBLASLt backend torch.mm routes to. torch can't
+// express that dtype combination (mm requires equal dtypes), so call hipBLASLt here,
+// with the heuristic-selected algo cached per shape.
+//
+// Row-major a[M,K] fp16 @ b[K,N] fp16 -> c[M,N] fp32 is computed as the column-major
+// equivalent D[N,M] = B_cm[N,K] x A_cm[K,M] (both OP_N): a row-major matrix reads as its
+// own col-major transpose, so the layout interpretation absorbs the transposes.
+
+namespace lt_f32 {
+    struct Key
+    {
+        int m, n, k;
+        bool operator<(const Key& o) const
+        {
+            return m != o.m ? m < o.m : (n != o.n ? n < o.n : k < o.k);
+        }
+    };
+    static hipblasLtHandle_t handle = nullptr;
+    static void* ws = nullptr;
+    constexpr size_t WS_SIZE = 128u * 1024 * 1024;
+    static std::map<Key, hipblasLtMatmulAlgo_t> algos;
+    static int sweeps = 0;
+    static std::mutex mtx;
+}
+
+bool hgemm_lt_f32out(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream)
+{
+    const int m = a.size(0);
+    const int k = a.size(1);
+    const int n = b.size(1);
+    if ((n | k) % 8) return false;
+
+    std::lock_guard<std::mutex> lock(lt_f32::mtx);
+    if (!lt_f32::handle)
+    {
+        if (hipblasLtCreate(&lt_f32::handle) != HIPBLAS_STATUS_SUCCESS) return false;
+        if (cudaMalloc(&lt_f32::ws, lt_f32::WS_SIZE) != cudaSuccess)
+        {
+            lt_f32::ws = nullptr;
+        }
+    }
+
+    hipblasLtMatmulDesc_t op = nullptr;
+    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
+    hipblasLtMatmulPreference_t pref = nullptr;
+    auto cleanup = [&]()
+    {
+        if (op) hipblasLtMatmulDescDestroy(op);
+        if (la) hipblasLtMatrixLayoutDestroy(la);
+        if (lb) hipblasLtMatrixLayoutDestroy(lb);
+        if (ld) hipblasLtMatrixLayoutDestroy(ld);
+        if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+    };
+
+    hipblasOperation_t nop = HIPBLAS_OP_N;
+    bool ok = true;
+    ok &= hipblasLtMatmulDescCreate(&op, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS;
+    ok &= hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSA, &nop, sizeof(nop)) == HIPBLAS_STATUS_SUCCESS;
+    ok &= hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSB, &nop, sizeof(nop)) == HIPBLAS_STATUS_SUCCESS;
+    ok &= hipblasLtMatrixLayoutCreate(&la, HIP_R_16F, n, k, n) == HIPBLAS_STATUS_SUCCESS;   // B buffer as cm [n,k]
+    ok &= hipblasLtMatrixLayoutCreate(&lb, HIP_R_16F, k, m, k) == HIPBLAS_STATUS_SUCCESS;   // A buffer as cm [k,m]
+    ok &= hipblasLtMatrixLayoutCreate(&ld, HIP_R_32F, n, m, n) == HIPBLAS_STATUS_SUCCESS;   // C as cm [n,m]
+    if (!ok)
+    {
+        cleanup();
+        return false;
+    }
+
+    // Algo: timed sweep over the heuristic's candidates on first encounter per shape, then
+    // cached. The gfx1101 heuristic's top prediction is frequently several times slower
+    // than another candidate for the same shape, so predictions alone can't be trusted;
+    // one timed pass costs a few hundred ms per shape and amortizes over the run.
+    // The sweep only pays off at chunk-aligned (large) m, where prompt chunking produces a
+    // handful of recurring shapes; small-m and over-budget cases take the heuristic's top
+    // pick so arbitrary prompt remainders can't trigger unbounded sweeps.
+    lt_f32::Key key{m, n, k};
+    float alpha = 1.0f, beta = 0.0f;
+    auto it = lt_f32::algos.find(key);
+    if (it == lt_f32::algos.end())
+    {
+        hipblasLtMatmulPreferenceCreate(&pref);
+        size_t ws_size = lt_f32::WS_SIZE;
+        hipblasLtMatmulPreferenceSetAttribute(
+            pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size));
+        hipblasLtMatmulHeuristicResult_t results[8];
+        int found = 0;
+        hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(
+            lt_f32::handle, op, la, lb, ld, ld, pref, 8, results, &found);
+        if (hs != HIPBLAS_STATUS_SUCCESS || found == 0)
+        {
+            cleanup();
+            return false;
+        }
+        bool sweep = m >= 256 && lt_f32::sweeps < 32;
+        if (sweep) lt_f32::sweeps++;
+
+        const void* a_ptr = a.data_ptr();
+        const void* b_ptr = b.data_ptr();
+        void* c_ptr = c.data_ptr();
+        hipblasLtMatmulAlgo_t best = results[0].algo;
+        if (sweep)
+        {
+            hipEvent_t ev0, ev1;
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+            float best_ms = 0.0f;
+            for (int i = 0; i < found; ++i)
+            {
+                // warmup (tensile kernel compile), then one timed launch
+                hipblasLtMatmul(lt_f32::handle, op, &alpha, b_ptr, la, a_ptr, lb, &beta,
+                                c_ptr, ld, c_ptr, ld, &results[i].algo, lt_f32::ws, lt_f32::WS_SIZE, stream);
+                cudaEventRecord(ev0, stream);
+                hipblasLtMatmul(lt_f32::handle, op, &alpha, b_ptr, la, a_ptr, lb, &beta,
+                                c_ptr, ld, c_ptr, ld, &results[i].algo, lt_f32::ws, lt_f32::WS_SIZE, stream);
+                cudaEventRecord(ev1, stream);
+                cudaEventSynchronize(ev1);
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, ev0, ev1);
+                if (best_ms == 0.0f || ms < best_ms)
+                {
+                    best_ms = ms;
+                    best = results[i].algo;
+                }
+            }
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+        }
+        cleanup();
+        it = lt_f32::algos.emplace(key, best).first;
+        return true;
+    }
+
+    hipblasStatus_t hs = hipblasLtMatmul(
+        lt_f32::handle,
+        op,
+        &alpha,
+        b.data_ptr(), la,
+        a.data_ptr(), lb,
+        &beta,
+        c.data_ptr(), ld,
+        c.data_ptr(), ld,
+        &it->second,
+        lt_f32::ws,
+        lt_f32::ws ? lt_f32::WS_SIZE : 0,
+        stream
+    );
+    cleanup();
+    if (hs != HIPBLAS_STATUS_SUCCESS)
+    {
+        lt_f32::algos.erase(it);
+        return false;
+    }
+    return true;
+}
+#endif

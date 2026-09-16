@@ -11,6 +11,9 @@ dist
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
 
+# profiling outputs (make profile)
+.profiling/
+
 # produced by torch hipify when building against ROCm torch
 exllamav3/exllamav3_ext/**/*.hip
 exllamav3/exllamav3_ext/**/*_hip.cuh

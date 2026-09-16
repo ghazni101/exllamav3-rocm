@@ -2,6 +2,7 @@ import os, time, threading, queue
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+import torch
 
 from exllamav3 import Model, Config, Cache, Tokenizer, Generator, Job
 from exllamav3.generator.sampler import GreedySampler, CategoricalSampler
@@ -77,6 +78,25 @@ def load_model():
     state["load_s"] = time.time() - t0
     print(f"[serve] model loaded in {state['load_s']:.1f}s", flush=True)
     threading.Thread(target=_driver_loop, daemon=True).start()
+
+    # Warm JIT/autotune/BLAS-algo caches (triton paged-attn + GDN chunk kernels compile on
+    # first use per shape; hipBLASLt runs a timed algo sweep per new GEMM shape) so the first
+    # real request doesn't pay seconds of one-time compilation
+    try:
+        t1 = time.time()
+        warm = tokenizer.encode("Warmup request. ", add_bos=True)
+        filler = tokenizer.encode("The quick brown fox jumps over the lazy dog. ", add_bos=False)
+        while warm.shape[1] < 512:
+            warm = torch.cat([warm, filler], dim=1)
+        job = Job(input_ids=warm[:, :512], max_new_tokens=8, sampler=GreedySampler())
+        serial, q = submit_job(job)
+        while True:
+            if q.get().get("eos"):
+                break
+        finish_job(serial)
+        print(f"[serve] warmup prefill+decode done in {time.time()-t1:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[serve] warmup skipped: {e}", flush=True)
 
 
 class GenReq(BaseModel):

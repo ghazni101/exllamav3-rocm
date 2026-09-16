@@ -84,7 +84,7 @@ setup_kwargs = (
                 extra_compile_args=extra_compile_args,
                 include_dirs=[sources_dir],
                 libraries=(
-                    ["hipblas"] if is_hip else
+                    ["hipblas", "hipblaslt"] if is_hip else
                     ["cublas"] if windows else
                     []
                 ),

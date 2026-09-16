@@ -278,10 +278,19 @@ class GDNLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
-        )
+        # Stream-ordered copies into pinned host buffers: the source state is final at this
+        # point in the stream and later overwrites are enqueued after the copy, so the
+        # buffers are consistent without draining the pipeline (a blocking .cpu() here cost
+        # ~55 ms per GDN layer per chunked prefill). The destination must be pinned or the
+        # async copy degenerates to a staged synchronous transfer; the caching host
+        # allocator defers buffer reuse until the copy completes.
+        rs = self.recurrent_state[slot, :1]
+        cs = self.conv_state[slot, :, :cdim]
+        rs_h = torch.empty(rs.shape, dtype = rs.dtype, pin_memory = True)
+        cs_h = torch.empty(cs.shape, dtype = cs.dtype, pin_memory = True)
+        rs_h.copy_(rs, non_blocking = True)
+        cs_h.copy_(cs, non_blocking = True)
+        return rs_h, cs_h
 
 
     def unstash(self, slot, stashed, position: int = 0):

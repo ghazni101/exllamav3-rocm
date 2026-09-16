@@ -1,18 +1,25 @@
-# ROCm 10 serving/build image for exllamav3 on RDNA3 (gfx1101 / RX 7700 XT).
+# Immutable ROCm 10 base image for exllamav3 on RDNA3 (gfx1101 / RX 7700 XT).
 # Base image local/rocm-base:10.0.0 ships a native ROCM 10.0 SDK (amdrocm-core-dev10.0-gfx1101)
 # under /opt/rocm with hipcc, hipBLAS and rocprofv3. Torch is the rocm7.14 wheel — keep
 # --no-deps so it cannot pull the (header-less) wheel SDK over the image's native install.
 #
-# Build:   docker build -f Dockerfile.rocm10 -t local/exl3-rocm:gfx1101 .
-# Run:     docker run --rm -it --device=/dev/kfd --device=/dev/dri \
-#            --group-add video --group-add render \
-#            -v /path/to/model:/models/qwen38-27b:ro local/exl3-rocm:gfx1101
+# This image intentionally does NOT contain the repo. The working tree is bind-mounted
+# (read-write) at /opt/exllamav3 at run time (see Makefile targets):
 #
-# The HIP extension is compiled at build time for the arch in PYTORCH_ROCM_ARCH
-# (default gfx1101; override with --build-arg PYTORCH_ROCM_ARCH=gfx1100 for RDNA3 iGPU-class parts).
+#   Build:  make image                  # or: docker build -f Dockerfile.rocm10 -t local/exl3-rocm:gfx1101-base .
+#   Run:    make shell serve profile    # docker run wrapper: GPU devices, repo bind, model, cache volume
+#
+# The C++/HIP extension (exllamav3_ext) is compiled by torch's JIT loader on first
+# `import exllamav3` into $HOME/.cache/torch_extensions — in the container that is the
+# exl3_exl3-cache named volume, so the compile happens once and persists across --rm runs.
+# The mount MUST be writable: ROCm's JIT path hipifies the .cu sources in place
+# (writes *.hip / *_hip.* files into exllamav3/exllamav3_ext/, already gitignored).
+# Python-only edits need nothing but a container restart; C++ edits trigger a recompile
+# on the next start (torch rebuilds when sources are newer than the cached artifact).
+# The target GPU arch is read from the live device (wave32-only check in util/arch_list.py),
+# so no PYTORCH_ROCM_ARCH is needed at runtime; the build-time default is the RX 7700 XT.
 
 FROM local/rocm-base:10.0.0
-ARG PYTORCH_ROCM_ARCH=gfx1101
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm
@@ -34,12 +41,9 @@ RUN /opt/venv/bin/pip install --no-cache-dir --no-deps \
     /opt/venv/bin/pip install --no-cache-dir -q \
     --index-url https://download.pytorch.org/whl/rocm7.14 "triton-rocm~=3.8.0"
 
+# Repo is bind-mounted here at run time; the mount also supplies serve_rocm.py and
+# profile_rocm.py as CMD entry points.
 WORKDIR /opt/exllamav3
-COPY . /opt/exllamav3
-# Non-editable install forces the C++/HIP extension to compile at build time.
-# --no-deps keeps pip from replacing the ROCm torch wheel with the CUDA one.
-RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} MAX_JOBS=8 \
-    /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -5
 
 ENV EXL3_MODEL=/models/qwen38-27b
 ENV EXL3_CACHE_TOKENS=32768

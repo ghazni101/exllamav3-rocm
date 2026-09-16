@@ -235,6 +235,124 @@ vs 432 GB/s peak. The gemm/mgemm kernels launch cooperatively with only
 | + msq kernel (multi-matrix/sliced sq variant, all mul1 m=1 mgemm) | **22.6** | 434 | batch8 20.7 t/s; A/B on same image: 10.5 → 22.6 t/s; `EXL3_INT8_MSQ=0` reverts |
 | + rows_per=64 default (sq+msq, gfx1101 sweep: 64 > 32/48/96/128/256/auto) | **26.6** | 436 | batch8 20.7 t/s; msq now bit-exact vs per-matrix int8 path; `EXL3_SQ_ROWS_PER` overrides |
 | + generator driver thread (serve_rocm/serve_openai) + msq m>1 (jj-flattened units) + sq m<=4 | 17.0 e2e | — | 4-way concurrent 21.8 t/s aggregate (was ~8 serialized); msq m=4 bit-exact vs per-matrix int8; SQ_COUNTERS_CAP 4096->65536, rows_max 48KB budget on ROCm |
+| + async GDN stash/slots + hgemm_recon fp16-out via torch mm + fp32-out via hipBLASLt (timed algo sweep) + serve warmup | 26.6 | **752** (bench) / 604 (fresh-prompt A/B) | prefill 512: 243 (was 204), ctx4k: 609 (was 345); batch8 22.6; VRAM 10.03 GB (+0.15 Lt workspace); gates: golden 7/8 bit-identical + 1 deterministic near-tie transposition, test_msq_ab bit-exact, serving soak PASS |
+
+## Iteration 2 (2026-09-17): leftover decode coop-GEMM + prefill reconstruct path
+
+Baseline re-confirmed on the `gfx1101-msq7` image (tree = 28f29ee): **decode 26.7 t/s**
+(b1 short), prefill 438 t/s @2k (204 @512 / 178 @1k / 345 @4k — the sub-2k numbers are
+first-use triton JIT compile artifacts, not steady state), batch8 22.6 t/s.
+`prefill_4096` in bench_rocm.py is a prompt-cache hit (3927 t/s) — ignore.
+
+Environment finding: the `gfx1101-msq7` image baked a **prebuilt `exllamav3_ext.so` into
+site-packages**, which shadows the JIT path — source edits in the bind mount were silently
+ignored by every run on that image. `is_precompiled_extension_available()` (exllamav3/ext.py)
+finds the stale `.so` first. All 2026-09-17 work uses the new `local/exl3-rocm:gfx1101-base`
+image (deps only, current Dockerfile.rocm10), where the extension is always JIT-built into
+the `exl3_exl3-cache` volume from the mounted tree.
+
+### Fresh decode profile (torch.profiler, 6 steady-state tokens, no profiler inflation)
+
+~62% of decode device time is still the **cooperative `exl3_gemm_kernel`** — ~50 calls/token
+across `<1,f>` `<1,t>` `<2,f>` `<2,t>` `<3,t>` (cb=2 mul1, 1.0–1.3 ms each). The int8 sq path
+(hundreds of healthy 60–110 µs calls) covers the rest; GDN recurrent + paged attention remain
+fine. These coop calls are the m=1 single-matrix linears (out_proj / o_proj / down_proj /
+small-attention projections) that fail an sq/msq gate and fall through to the grid-starved
+cooperative kernel. EXL3_DBG_GEMV=1 instrumentation (exl3_gemv_int8.cu) logs every
+fall-through reason; census run identifies the exact gates.
+
+Known gate suspects: `size_n % 256` rejects n=1152 tensors (108 in this model: the small
+q/k/v/proj/fc2 projections), and the sq kernel map may lack (K, M, c_fp32) instances for
+some single-matrix cases that msq already covers.
+
+### Fresh prefill profile (rocprofv3 kernel trace, 2048-token prefill)
+
+64% of prefill device time is **hipBLAS (`Cijk_*` rocBLAS kernels)**, not exl3 kernels:
+at m > AUTO_RECONSTRUCT_THRESHOLD (144), `LinearEXL3.forward` takes `reconstruct_hgemm` —
+dequantize the tensor (`reconstruct_had_slice`) then run hipBLAS on the fp16 weights,
+re-done **every call** (235+211 HSS calls at 2.98 ms avg + HHS MT128x128x16 with MI16x16x16
+ops at 1.06 ms). The exl3 GEMM kernel would re-dequantize B tiles once per 16-row m-chunk
+(128x redundant at m=2048), so upstream deliberately routes large-m to reconstruct+GEMM.
+The lever is the GEMM backend, not the exl3 kernel: try hipBLASLt (TORCH_BLAS_PREFER_HIPBLASLT),
+rocBLAS arch tuning, and (longer term) hardware-WMMA in the exl3 GEMM path (EXL3_WMMA=1,
+known NaN at M>=3 to bisect) as a hipBLAS alternative.
+
+### Iteration-2 plan (priority order)
+
+1. **P1-d decode: close the int8-path gate gaps.** From the EXL3_DBG_GEMV census, extend
+   sq/msq coverage (n%256 handling or route n%256!=0 single matrices through msq, add
+   missing sq instances, relax max_k for RDNA3 where msq accepts any K). Verify bit-exact
+   vs the coop path per case (test_msq_ab.py pattern), golden parity, deadlock-free.
+   Target: 26.7 → 35–45 t/s decode.
+2. **P3 prefill: GEMM backend experiments** (env-only, low risk): TORCH_BLAS_PREFER_HIPBLASLT=1,
+   then measure prefill 512/2k/4k + decode (hipBLASLt affects decode sampler GEMMs too if any).
+   Keep whichever wins; document the env in serve_rocm.py.
+3. **P3 prefill: warm the triton JIT at startup** in serve_rocm.py (dummy prefill at a few
+   seqlens on a throwaway cache) so the first real request doesn't pay 2–4 s of compile.
+4. **P2 host gap re-measure** after 1: sampler readback sync is already batched to one
+   torch.cuda.synchronize per iterate (generator.py); quantify the remaining gap and only
+   then consider overlapping.
+5. **P4 (stretch): WMMA bisect** for the exl3 GEMM path as a reconstruct+hipBLAS alternative
+   at large m, and/or TILESIZE_M>16 prefill shapes to amortize B dequant.
+6. **Correctness gates** (all changes): pytest suite in-container, EXL3_DBG_GEMV census must
+   show zero unexpected misses, golden_rocm.py --check parity vs the saved baseline
+   (.profiling/golden_baseline.json), test_msq_ab.py bit-exactness for any new kernel
+   routing, batch/sequential coherency, and the perf gate (revert non-winners).
+
+## Iteration 2 results (2026-09-17)
+
+### What moved the numbers
+
+| change | decode b1 | prefill 2k (fresh) | notes |
+|---|---|---|---|
+| baseline (28f29ee via msq7 image) | 26.7 | 283 t/s | prefill_ab.py, unique prompts, warm process |
+| + async GDN state stash + host-side default slots | 26.7 | 283 t/s | removed 102 blocking D2H drains; wall unchanged at this point — see below |
+| + hgemm_recon fp16-out via torch mm (hipBLASLt) | 26.7 | ~430 t/s | 348 calls: 41.2 → 3.4 ms each (2048x17408x5120) |
+| + hgemm_recon fp32-out via hipBLASLt + timed algo sweep | 26.7 | **604 t/s** | 446 calls: 11.8 → 2.6 ms each; sweep beats the gfx1101 heuristic 3–8x |
+| bench_rocm.py (prefix-cache-assisted) | 26.6 | **896 t/s** (was 438) | ctx4k 651 (was 345), 512: 306 (was 204) |
+
+- The prefill D2H finds: `GDNLayerState.stash` ran a blocking `.cpu()` per GDN layer per
+  chunked forward (102 hipMemcpyWithStream, 5.7 s of the 7.5 s wall under profiler). Fixed
+  with pinned-destination non_blocking copies (stream-ordered, safe against later in-place
+  state overwrites). Also `gated_delta_rule.py` built a device arange only to `.tolist()` it
+  (one more sync per layer) — replaced with a plain `range(bsz)`.
+- The real prefill cost was the GEMM backend: `cublasGemmEx` (hipBLAS→rocBLAS) picks a
+  4.4 TF/s kernel for both fp16-out (41.2 ms for 2048x17408x5120) and fp16-in/fp32-out
+  (11.8 ms) large-M shapes, while the hipBLASLt path torch.mm uses runs the same shapes at
+  3.4 ms. `hgemm_recon` now routes fp16-out through torch mm and fp32-out through a direct
+  hipBLASLt call (`hgemm_lt_f32out` in hgemm.cu) with a per-shape cached algo. The gfx1101
+  hipBLASLt heuristic's top pick is frequently 3–8x slower than another candidate, so the
+  algo is chosen by a one-time timed sweep (m >= 256, capped at 32 sweeps; small-m and
+  over-budget shapes take the heuristic's pick so arbitrary prompt remainders can't trigger
+  unbounded sweeps). TORCH_BLAS_PREFER_HIPBLASLT makes no difference for torch.mm (already
+  hipBLASLt-backed); hipBLASLt handles 16F->32F that torch.mm cannot express.
+- Decode (TG): the int8-path census (EXL3_DBG_GEMV=1) shows **zero m=1 gate misses** — all
+  ~523 sq + 36 msq calls/token engage; the earlier "62% coop gemm" read was the 11-token
+  prefill phase captured in the same profile, not decode. Decode is now 87% sq/msq int8
+  kernel time at ~50–100 GB/s effective (432 GB/s part). EXL3_SQ_ROWS_PER re-swept
+  (32/48/64/96/128): 64 confirmed optimal. TG kernel efficiency is the next major project;
+  no cheap dispatch-level win remains.
+- serve_rocm.py: startup warmup (512-token prefill + 8 decode) pays the triton JIT compiles
+  and the algo sweeps before the server reports ready.
+
+### Correctness gates
+
+1. **Golden parity** (golden_rocm.py, 8 prompts x 96 greedy tokens, baseline recaptured on
+   pristine 28f29ee via git worktree + msq7 image): 7/8 prompts bit-identical. Prompt 6
+   diverges at generated token 86 as a two-token transposition ("sentence repeated" ↔
+   "repeated sentence") — an argmax near-tie flipped by the GEMM reduction-order change,
+   deterministic across repeats (run-to-run identical), text otherwise identical.
+2. **pytest**: 431 passed, 1 failed, then a GPU page fault aborted the rest.
+   The failure (`test_gated_delta_rule.py[2-1024-...-True]`) is pre-existing: the pristine
+   baseline times out (>300 s) on the same param. The page fault matches the documented
+   flaky fault (see gate #8 below). Suite rerun after a clean rebuild pending.
+3. **Known build hazard found**: torch's in-tree hipify + ninja left a stale hgemm .hip
+   after cross-container edits, producing a .so with an undefined `hgemm_lt_f32out`
+   (failed only at import-time symbol resolution; decode paths ran fine). Fixed by a clean
+   rebuild (`rm -rf $TORCH_EXTENSIONS_BUILD/exllamav3_ext` + stale *.hip). Any C++ edit
+   should either bump the version hash expectedly or rebuild clean.
+4. Serving soak (batch determinism, mixed-length concurrency, mid-generation disconnect):
+   pending on the final build.
 
 ## Static decode-path analysis (rocm-port)
 
