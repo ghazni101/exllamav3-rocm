@@ -1,5 +1,7 @@
-# tg-1a perf image: deployed base + patched sources, extension recompiled in place.
-FROM exllamav3-rocm:serve
+# tg-1b perf image: the DEPLOYED tabbyapi-rocm:serve (tuned ext, Sep 16) + patched
+# sources, extension recompiled in place. Do NOT build from exllamav3-rocm:serve --
+# that base predates the msq/sq tuning (ext .so from Sep 14) and measures ~half decode.
+FROM tabbyapi-rocm:serve
 ENV PYTORCH_ROCM_ARCH=gfx1100 EXLLAMA_VERBOSE=1 MAX_JOBS=8
 WORKDIR /opt/exllamav3
 COPY . /opt/exllamav3

@@ -79,8 +79,8 @@ def main():
                             done += 1
         out = {}
         for nm, j in jobs:
-            seq = j.sequence_ids
-            out[nm] = seq[0].tolist() if hasattr(seq[0], "tolist") else list(seq[0])
+            ids = j.sequences[0].sequence_ids.torch().flatten().tolist()
+            out[nm] = [int(x) for x in ids]
         print(f"[gate] {len(jobs_spec)} jobs ({'concurrent' if concurrent else 'sequential'}) "
               f"in {time.time()-t_start:.1f}s", flush=True)
         return out
