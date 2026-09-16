@@ -1,0 +1,6 @@
+# tg-1a perf image: deployed base + patched sources, extension recompiled in place.
+FROM exllamav3-rocm:serve
+ENV PYTORCH_ROCM_ARCH=gfx1100 EXLLAMA_VERBOSE=1 MAX_JOBS=8
+WORKDIR /opt/exllamav3
+COPY . /opt/exllamav3
+RUN pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -20
