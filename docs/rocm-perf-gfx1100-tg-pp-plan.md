@@ -552,3 +552,107 @@ one command under the GPU lock.
   serve profiles, drive one request at a time inside the attach window.
 - Run-to-run rep count is 1 for the session-2 traces (the traces are for attribution, not
   wall-time claims); wall-time claims still cite the unprofiled bench numbers.
+
+---
+
+## 9. Kernel optimization plan v2 (grounded in the rocprofv3 traces)
+
+Supersedes §5's tg/pp items. Every lever below cites its measured evidence, has a concrete
+first action, and an acceptance gate. Effective-GB/s figures are derived from device-busy time
+and the 12.1 GiB/token weight traffic (counters remain unavailable, findings-log §8.1).
+
+### What the traces say (one paragraph)
+
+Decode b1: 87.7 % of device time is the int8 GEMV moving ~13 GB/token in ~33 ms ≈ **400 GB/s =
+43 % of the 919 GB/s practical peak** — the single biggest tg lever is GEMV efficiency, not
+host gaps (3–10 %) and not batching (irrelevant at b1). Batch-8: the 7 per-layer projections
+run the cooperative kernel at m=8 — **48 blocks on 96 CUs (half the machine), 72 % of device
+busy** — capping aggregate at 28.6 tok/s where the weight-shared roofline is ~560. Prefill:
+in-chunk device-busy is 99 % but the GEMMs run at ~30 TF/s where the same `hgemm_recon` binding
+delivers **90–100 TF/s in a clean loop on identical shapes** — the pp lever is call context
+(fresh 100–180 MB buffers per linear, serialized dequant, Python orchestration), not the library.
+
+### TG levers
+
+**T1 — make msq cover single-matrix m>4 (batch-8 28.6 → 150–250 aggregate).**
+The msq kernel's design comment states it covers `bszm_in == 1, any m` ("units are
+(matrix-row jj = j*size_m + row)"), and the batch-8 trace shows msq working at m=8 for
+multi-matrix bundles — so the tg-1b deadlock is a bug in a supported configuration, not a
+missing feature. Narrowed suspects, in order:
+  (a) staging-key reuse: blocks re-stage a slice only when `slice != prev_slice`; if the key
+      ignores jj, a block crossing units (jj0,sl)→(jj1,sl) consumes stale splats (silent
+      corruption); check the msq staging key implements the documented "(jj, slice)";
+  (b) epilogue-trigger/counter stride mismatch when `num_jj = m` grows (counters are
+      `jj × nb256_max`; the ksplit-th contributor must fire per (jj, nb256));
+  (c) `qsums`/`partials` offsets overlap for large num_jj.
+Actions: standalone kernel A/B (no generator) sweeping `bszm_in × bszm_out × m ∈ {1,8,16}`
+against per-row sq, in a `--cap-add=SYS_PTRACE` container with py-spy/printf; fix; then the
+gate sequence G1' (golden compare, m≤4 paths unchanged) → G2 (batch-vs-sequential m=8) →
+soak → bench. Effort: 1–2 sessions. This is the highest-value item: serving throughput is
+batch throughput.
+
+**T2 — b1 GEMV efficiency: 400 → 650–800 GB/s (b1 29 → 42–52 tok/s).**
+A-traffic is already negligible by design (each block stages its k-slices once, ~KB per slice;
+the earlier "activation re-read" hypothesis is withdrawn). The residual gap is occupancy/
+latency: 384 blocks × 256 threads at 64–88 VGPRs cannot fully reside (VGPR file allows ~5
+waves/SIMD, not 16), so not enough weight streams are in flight. Because counters are dead,
+optimize against a **standalone kernel microbench** (known bytes, in-kernel/event timing — no
+model, no profiler): sweep grid cap (384 → 768/1024), `rows_per` (64/32/16), `__launch_bounds__`
+VGPR caps, prefetch depth for the smem-staged units (K≥5), and wider B loads where not already
+uint4. Each config's GB/s is directly visible; take the winner into the model and re-gate.
+Effort: 1 session of tuning + gates.
+
+**T3 — batch-4 anomaly (31.7 aggregate ≈ 4× worse than the amortized expectation).**
+The sq kernel is explicitly designed to amortize extraction and the B stream across m≤4 rows
+("M activation rows share the decoded weights"), so a true m=4 pass should cost ≈ one m=1 pass
+→ batch-4 should aggregate ~100+, not 31.7. Two candidate explanations, one trace resolves
+them: (i) the generator doesn't actually issue m=4 calls at batch-4 (cache/page preparation
+serializes jobs) — fix is in the generator; (ii) the m≤4 sq instantiations don't amortize in
+practice (per-m template cost) — fix is register-tiling m in `gemv_int8_unit_wide`. Verify
+first from a 24-token batch-4 run under `--kernel-trace` (count sq launches and per-launch
+duration vs m). Effort: half a session after T1/T2 (same harness).
+
+**T4 — host hygiene (b1 +3–5 %, after T1–T3).** Reuse the ~146 per-step events
+(create/record/query/destroy every step) in the generator's timing path; the per-step
+`hipDeviceSynchronize` and torch's `hipGetDevice` churn stay (structural/torch-side).
+
+### PP levers
+
+**P1 — bisect the 3× GEMM gap, then fix with persistent buffers (prefill 342 → 600–900).**
+Probe variant matrix, one run: `hgemm_recon` with (i) reused buffers (known 90–100 TF/s),
+(ii) fresh `b` per call (as the model does: 100–180 MB `torch.empty` per linear),
+(iii) fresh `c`, (iv) fresh all + interleaved dummy dequant kernels. Whichever cell drops to
+~30 TF/s names the mechanism; the fix is pp-1.2 regardless — a persistent weight slab + output
+scratch sized to the largest linear, allocated once at load (`exl3.py:193/222` is the churn
+site). Note the current fresh-buffer behavior may also be triggering hipBLASLt heuristic cache
+misses; the bisect shows that too. Effort: half a session to bisect + a ~30-line patch + gates.
+
+**P2 — overlap dequant with GEMM (after P1; +10–15 %).** Double-buffer the persistent weight
+slab: reconstruct linear i+1 on a side stream while GEMM i executes; event-join before the GEMM.
+The reconstruct kernels are only ~4 % of busy today but become the serialized tail once P1
+removes the buffer churn.
+
+**P3 — C++ driver for the per-layer prefill sequence (after P2; removes residual host gaps).**
+One extension entry that walks the (recon, GEMM) list for a chunk — the pattern the BC/`msq`
+paths already use. Only if post-P2 wall-vs-busy stays >10 %.
+
+**P4 — chunk_size sweep (config-only, do first).** Probe shows m=4096 GEMMs at 100.4 TF/s vs
+93 at 2048; server `chunk_size 2048` means a 3.2k prompt pays two sampler round-trips. Measure
+2048/4096/8192 on cold 3.2k and 8k prompts; VRAM cost is tens of MB. Zero-risk, immediate.
+
+### Sequencing and targets
+
+| step | lever | metric | now → target |
+|---|---|---|---|
+| 1 | P4 chunk sweep (config) | cold TTFT 3.2k | 6.9 s → 4–5 s |
+| 2 | P1 bisect + persistent buffers | prefill-2k | 342 → 600–900 tok/s |
+| 3 | T1 msq single-matrix fix | batch-8 aggregate | 28.6 → 150–250 tok/s |
+| 4 | T2 GEMV microbench tuning | decode b1 | 29 → 42–52 tok/s |
+| 5 | T3 batch-4 amortization | batch-4 aggregate | 31.7 → 80–110 tok/s |
+| 6 | P2 overlap + P3 driver | prefill-2k | toward 900–1100 tok/s |
+| 7 | T4 host hygiene | decode b1 | +3–5 % |
+
+Every kernel change re-runs: golden-token compare (m≤4 + reconstruct paths must stay
+token-identical), batch-vs-sequential at m=8, the standalone A/B for the touched kernel,
+10-minute no-deadlock soak, bench_lean perf gate (revert if not a measurable win), and a
+`--kernel-trace` confirmation that the intended kernel's share actually moved.
