@@ -155,6 +155,12 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
+    // tg-1a (RDNA): multiProcessorCount is the WGP count, and one WGP = 2 CUs on RDNA3.
+    // A cooperative grid must span every CU — at the raw WGP count (48 blocks on a
+    // 96-CU gfx1100) half the device idles in every coop launch. The GEMV slicing
+    // paths (exl3_gemv_int8.cu) deliberately keep the raw count; only the coop
+    // launch and its autotuner cap are extended here.
+    if (cc == CC_RDNA3) num_sms *= 2;
     int* locks = DevCtx::instance().get_locks(device);
 
     // Dispatch
