@@ -241,29 +241,6 @@ int exl3_gemm_gr
         }
     }
 
-    // tg-1b: single-matrix projections at m > 4 previously fell through to the cooperative
-    // kernel (48 blocks on 96 CUs; 72% of batch-8 device time, and the coop grid cannot be
-    // widened - see the tg-1a note above). Route them to the msq kernel instead: a regular
-    // launch whose work units already flatten (matrix x row), so with one matrix the units are
-    // just the m rows. Requires the had forms, like the sq path; declines otherwise so the
-    // caller falls through exactly as before. num_tokens is unused by the kernel in plain mode.
-    if (mul1 && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() &&
-        suh_ptr && A_had_ptr && svh_ptr && force_shape_idx <= 0 && force_num_sms <= 0)
-    {
-        uintptr_t b_list[1] = { (uintptr_t) B_ptr };
-        uintptr_t suh_list[1] = { (uintptr_t) suh_ptr };
-        uintptr_t svh_list[1] = { (uintptr_t) svh_ptr };
-        if (exl3_gemv_int8_msq
-        (
-            A_ptr, b_list, C_ptr, size_m, size_k, size_n,
-            suh_list, A_had_ptr, svh_list,
-            nullptr, nullptr, 1, 1, -1, -1, 1,
-            nullptr, nullptr, nullptr, nullptr, 0,
-            K, c_fp32, device, num_sms, stream, graph
-        ))
-            return 0;
-    }
-
     // On ROCm the autotuner itself clamps concurrency to 1 (see tune() in
     // coop_autotune.cu): RDNA over-reports cooperative co-residency and
     // concurrency > 1 deadlocks grid.sync(). (shape, num_sms) tuning still applies.

@@ -110,12 +110,18 @@ def main():
             print(f"[gate] PASS: all {len(ref)} prompts token-identical ({time.time()-t0:.0f}s)")
 
     elif mode == "batch":
-        names = ["batch_a", "batch_b", "batch_c", "batch_d"]
+        # 8 mid-length prompts: sequential (m=1, sq GEMV path) vs concurrent (m=8, the
+        # msq path for m>4). The m=8 concurrent run is what exercises tg-1b.
+        names = ["batch_a", "batch_b", "batch_c", "batch_d", "batch_e", "batch_f", "batch_g", "batch_h"]
         ptexts = [
             "Summarize the causes of the industrial revolution in three paragraphs.",
             "Describe how a modern GPU executes thousands of threads. Be specific about warps.",
             "Write a short story about a lighthouse keeper who discovers a strange signal.",
             "List the planets and one distinguishing fact about each.",
+            "Explain how public-key cryptography works to a curious teenager.",
+            "Compare and contrast the Roman Republic with the Roman Empire.",
+            "Write a Python one-liner that reverses the words in a sentence, then explain it.",
+            "What are the primary greenhouse gases and their main sources?",
         ]
         pids = [tok.encode(t, add_bos=True) for t in ptexts]
         spec = list(zip(names, pids, [128] * 4))
