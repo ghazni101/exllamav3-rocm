@@ -138,6 +138,20 @@ static int* gemv_int8_get_ws(int device, size_t ws_ints)
     return ws.ws;
 }
 
+// Unit routing override for the sq path (EXL3_SQ_STAGE_SMEM: 0 = narrow, 1 = smem-staged, unset =
+// the per-arch compile-time predicate). Diagnostic A/B knob for the RDNA staging question; the
+// non-default arms still reserve the same shared memory so the arm comparison stays like for like.
+// Read once per process, like the other kernel knobs here.
+static int exl3_sq_stage_arg()
+{
+    static const int v = []
+    {
+        const char* e = getenv("EXL3_SQ_STAGE_SMEM");
+        return e ? atoi(e) : -1;
+    }();
+    return v < 0 ? -1 : (v ? 1 : 0);
+}
+
 // m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
 // cooperative kernel (and from there to the regular fp16 kernel).
 static bool exl3_gemv_int8_sq
@@ -158,13 +172,15 @@ static bool exl3_gemv_int8_sq
     // EXL3_SQ_ROWS_PER pins the slice height (multiple of 8, >= SQ_MINROWS). On RDNA3 the
     // single-wave rule's rows_per = rows_max starves occupancy on wide matrices (lm_head):
     // swept on gfx1101, 64 beats auto by ~19% decode e2e (32/48/96/128/256 all slower).
+    // gfx1100 re-sweep (2026-09-17, model tensors, cold rotation): 48 beats 64 by ~6% on the
+    // K=3/4 sq kernels and +4.8% decode b1 / +4.2% b4 end-to-end, so 48 is the ROCm default.
     static const int rows_per_env = []
     {
         const char* e = getenv("EXL3_SQ_ROWS_PER");
         return e ? atoi(e) : 0;
     }();
 #if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 64) + 7) & ~7, SQ_MINROWS);
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 48) + 7) & ~7, SQ_MINROWS);
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif
@@ -183,9 +199,12 @@ static bool exl3_gemv_int8_sq
             rows_per = MIN(rows_per_arg, MIN(rows_max, (rows_total + 7) & ~7));
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
     };
+    const int stage_arg = exl3_sq_stage_arg();
     auto smem_for = [&] (int rows_per) -> size_t
     {
-        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        // Reserve the B-stage region whenever either the compile-time routing or the override can
+        // use it, so the smem allocation (and therefore the occupancy) does not depend on the arm
+        size_t stage = gemv_int8_reserve_stage(K, stage_arg) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
         return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
                + stage + (size_t) 2 * M * 128 * 4;
     };
@@ -240,7 +259,8 @@ static bool exl3_gemv_int8_sq
         (void*) &suh_ptr,
         (void*) &A_had_ptr,
         (void*) &svh_ptr,
-        (void*) &rows_per_arg
+        (void*) &rows_per_arg,
+        (void*) &stage_arg
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
@@ -317,7 +337,7 @@ bool exl3_gemv_int8_msq
         return e ? atoi(e) : 0;
     }();
 #if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 64) + 7) & ~7, SQ_MINROWS);
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 48) + 7) & ~7, SQ_MINROWS);
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif
@@ -438,6 +458,8 @@ bool exl3_gemv_int8_msq
     return true;
 }
 
+// Exl3_gemm's force_num_sms override reaches the sq/int8 kernels through here so a sweep can scale
+// the launch geometry (grid multiplier) and the slice height without a rebuild. 0 = hardware default.
 bool exl3_gemv_int8
 (
     const at::Tensor& A,
@@ -446,6 +468,7 @@ bool exl3_gemv_int8
     const c10::optional<at::Tensor>& suh,
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
+    int num_sms_arg,
     cudaStream_t stream,
     Graph* graph
 )
@@ -462,7 +485,7 @@ bool exl3_gemv_int8
     int device;
     cudaGetDevice(&device);
     if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
-    int num_sms = DevCtx::instance().get_num_sms(device);
+    int num_sms = num_sms_arg > 0 ? num_sms_arg : DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
 

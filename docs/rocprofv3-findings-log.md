@@ -665,3 +665,72 @@ model; trim before any softmax/KLD math, both arms.)
 - T3 batch-4 amortization: cold sq@4 = 4.1× sq@1 — extraction amortization does not reduce
   DRAM traffic; batch-4 ≈ batch-1 aggregate is traffic-true, not a generator bug.
 - T1 batch-8 via msq route: parity at m=8, regression at m ≥ 16, reverted (11.3).
+
+## 12. Session 5 (2026-09-17): pure-AR speedup — what the limiter actually is
+
+Branch `rocm-perf`; images `exllamav3-rocm:perf-a/-b/-c` (perf-c = shipping candidate). Full
+detail and per-item status in `docs/rocm-perf-gfx1100-tg-pp-plan.md` §11.
+
+### 12.1 The dp4a-issue hypothesis is refuted, and the arithmetic behind it was wrong
+
+The plan's central decode hypothesis was that the int8 GEMV is limited by V_DOT4 issue throughput:
+"0.25 dp4a per weight x 26.5 G weights = 6.6 G dp4a/token, which at the achieved rate is ~25 ms of
+the 34 ms token". Two measurements kill it:
+
+- **ISA census** of the installed extension (`profiling/isa_census.py` + `iso_dump.sh` over 140
+  gfx1100 code objects): every sq unit issues **16 v_dot4 per (16 k-rows x 32 columns) unit row**,
+  i.e. **one dp4a per 32 weights** (dp4a/byte = 0.25/K) - not 0.25 per weight. That is **828 M
+  warp-dp4a per token, 8x less than assumed**; the "25 ms" match was a coincidence of two wrong
+  numbers.
+- **A1 probe** (`profiling/dp4a_peak.hip`, `__builtin_amdgcn_sudot4` = the same instruction
+  `__dp4a` lowers to): pure dp4a peaks at **240 G warp-dp4a/s** with one IMAD per dp4a (the GEMV's
+  mix) at 93 G; a pure FMA loop reaches **490 G warp-inst/s**, which also **halves the plan's issue
+  ceiling** (HIP reports 48 multiprocessors x 4 SIMD32 x 2.482 GHz = 476 G, and the FMA probe hits
+  103% of that, so the 96-CU x 4 = 953 G figure in the plan double-counts).
+
+The sq family therefore runs at **13.7% of the dp4a ceiling and ~35% of the issue ceiling** (K=4
+wide unit, 525 GB/s x 84 insn/256 B = 172 G warp-inst/s) while streaming at 57% of the DRAM peak:
+**no resource is saturated, the kernel is latency-bound**. That is why the plan's B2 (deeper row
+pipeline for more MLP) was attempted - and it, too, failed: 2.5% *slower* cold (204.7/204.9 vs
+210.0/209.6 GB/s) and it hung the generator in both end-to-end arms. The wide unit's prefetch depth
+is not its limiter either.
+
+### 12.2 Measurement hygiene: cold rotation needs a pool >> the Infinity Cache
+
+`msq_ab2.py`'s rotation (6 same-shape instances) is **not** cold enough: 6 x 31-45 MB is only ~2-3x
+the 96 MB Infinity Cache, and with a sequential pass over the pool a large fraction of each pass
+re-reads what it just read. Measured on identical kernels: the same call takes 0.0917 ms/pass with a
+267 MB pool and 0.234 ms with an 891 MB pool (8.9x IC) - a 2.5x difference. The protocol that
+reproduces production is: pool >= 6x IC, **no warm-up pass** (the first pass *is* the cold
+measurement), per-call event pairs, one configuration per process. Validation: that protocol's
+m=4/m=1 ratio (3.6x) predicts the in-model batch-4 aggregate (+3.6% at b4) that `bench_lean` measures.
+
+**Arm-order contamination is real and large.** With all `force_num_sms` values timed in one process,
+`sms=0` and `sms=48` - which resolve to the same `num_sms=48` (`ext.g_get_num_sms(0)` = 48) -
+differed by 2.2x on K=3, with tight min/max inside each arm. One configuration per process removes
+it; every number quoted in §11 is one-config-per-process.
+
+### 12.3 What shipped, and the honest decode ceiling
+
+**Shipped: the ROCm slice-height default 48** (was 64) in both the sq and the msq int8 launchers:
++8.5% decode b1 (29.15 -> 31.63 tok/s), +3.1% b4, +1.3% b8, prefill unchanged, reproduced to 0.03%
+across two independent arms. Jumping to **narrow instead of the smem-staged unit** for K=3/5 - which
+is 9% faster in the cold kernel bench - is only +1.6% end-to-end and is therefore *not* shipped; the
+per-arch routing stays, with `EXL3_SQ_STAGE_SMEM` left as an A/B knob.
+
+**Decode concurrency is traffic-true.** b1 31.6, b2 34.9, b4 32.8, b8 32.5 tok/s aggregate: batching
+buys ~10% and then goes flat, exactly as the cold-traffic measurements predict (m=4 costs 3.6x m=1).
+The honest serving ceiling for this model on this GPU is **~31-35 tok/s**, and the b6 arm (6
+concurrent) reproducibly *regresses* to 23 tok/s - a queue/scheduler artifact worth a follow-up, not a
+property of the int8 path.
+
+### 12.4 Prefill: named at last, and the fix is a library configuration
+
+`profiling/prefill_profile.py` (torch.profiler over a cold nonced 2048-token prefill) shows **68.2% of
+prefill device time in a single hipBLAS Tensile configuration** (`Cijk_Ailk_Bljk_HSS_BH_MT64x32x8_...`,
+223 launches, 12.8 ms each = 28.5 TFLOP/s) with a second config at 11.2%, reconstruct at 2.5% and
+everything else (norms, elementwise, copy, attention/GDN, host launches) under 12% combined. This
+settles the three-way disagreement in the plan's fact 6: the 28.7 TFLOP/s in-model number is the
+in-model truth, and the 83.5-100 TFLOP/s figures come from a *different library* - torch's backend
+here is hipBLASLt, while the ext calls hipBLAS `cublasGemmEx` with `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
+The prefill headroom is therefore configuration selection, ~2/3 of prefill.

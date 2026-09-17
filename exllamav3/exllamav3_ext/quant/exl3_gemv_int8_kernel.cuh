@@ -328,6 +328,12 @@ __device__ __forceinline__ void gemv_int8_row_sums
 // at (M + r) * slice_stride - at M = 1 this is exactly the coop kernel's sh_as/sh_as2 layout). Row
 // accumulators go to accs + r * acc_stride, atomically or with plain stores (exclusive per-slice
 // partials of the sq kernel).
+// NOTE (2026-09-17): a deeper row pipeline (4 row registers in flight instead of 2, template-
+// parameterised and A/B'd as EXL3_SQ_PF=5 on gfx1100) measured 2.5% SLOWER cold
+// (profiling/sq_sweep1.py: 204.7 vs 209.8 GB/s at (5120,17408) K=4 m=1, two runs each) and hung
+// the generator end-to-end twice, against two clean runs at the default depth - so the pipeline
+// depth is not the wide unit's limiter and the change was dropped. Do not reintroduce it without
+// a hang-free end-to-end run.
 template <int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_wide
 (
@@ -712,11 +718,25 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 }
 
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
-// are at the ALU floor / DRAM-bound, wide covers 4)
+// are at the ALU floor / DRAM-bound, wide covers 4). That measurement is Ampere, never RDNA:
+// EXL3_SQ_STAGE_SMEM forces the sq kernel's choice per process for an A/B (0 = narrow, 1 = smem,
+// unset = this predicate). The B-stage region is reserved whenever either side could use it, so an
+// arm that forces smem on keeps the same shared-memory allocation as the arm that forces it on by
+// default (-1 = compile-time routing).
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
     return bits == 3 || bits == 5 || bits == 7;
 }
+
+__host__ __device__ constexpr bool gemv_int8_reserve_stage(int bits, int stage_arg)
+{
+    return gemv_int8_stage_smem(bits) || stage_arg == 1;
+}
+
+// NOTE (2026-09-17): the narrow unit measures ~9% faster than the smem-staged one on gfx1100 for
+// the staged K (3, 5) in the cold-rotation bench (profiling/sq_sweep1.py), but forcing it
+// end-to-end with EXL3_SQ_STAGE_SMEM=0 moved decode b1 by only +1.6% - inside bench noise - so the
+// per-arch default stays as tuned (staged for 3/5/7); the override is kept as an A/B knob.
 
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
 // striped over all warps of the grid. sh_tmp: 128 floats per warp.
@@ -991,7 +1011,8 @@ void exl3_gemv_int8_sq_kernel
     const half* __restrict__ suh,
     half* __restrict__ A_had,
     const half* __restrict__ svh,
-    const int rows_per_arg      // 0 = auto (single-wave rule); >0 = fixed slice height
+    const int rows_per_arg,     // 0 = auto (single-wave rule); >0 = fixed slice height
+    const int stage_arg         // -1 = per-arch unit routing, 0 = force narrow, 1 = force smem
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -1023,7 +1044,9 @@ void exl3_gemv_int8_sq_kernel
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
-    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    // Mirrors the host's smem_for(): the stage region is where the host reserved it
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_reserve_stage(bits, stage_arg) ? GEMV_STAGE_D * 8 * 16 * bits : 0));
+    bool use_smem = stage_arg < 0 ? gemv_int8_stage_smem(bits) : stage_arg != 0;
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1044,7 +1067,7 @@ void exl3_gemv_int8_sq_kernel
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
             gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
-        else if constexpr (gemv_int8_stage_smem(bits))
+        else if (use_smem)
             gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
         else
             gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);

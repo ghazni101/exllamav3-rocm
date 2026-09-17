@@ -1,4 +1,4 @@
-"""Lean A/B bench: decode b1, prefill 2k (cold), batch-4 and batch-8 aggregate."""
+"""Lean A/B bench: decode b1, prefill 2k (cold), batch-2/4/6/8 aggregate."""
 import os, json, time, random, string
 import torch
 from exllamav3 import Model, Config, Cache, Tokenizer, Generator, Job
@@ -60,7 +60,9 @@ def main():
     r = run(gen, p, 4)
     out["prefill_2k_tps"] = round(p.shape[1] / r["time_prefill"], 1)
 
+    out["batch2_agg_tps"] = round(run_batch(gen, [base + i for i in range(2)], 160), 2)
     out["batch4_agg_tps"] = round(run_batch(gen, [base + i for i in range(4)], 128), 2)
+    out["batch6_agg_tps"] = round(run_batch(gen, [base + i for i in range(6)], 112), 2)
     out["batch8_agg_tps"] = round(run_batch(gen, [base + i for i in range(8)], 96), 2)
     print(json.dumps(out), flush=True)
 

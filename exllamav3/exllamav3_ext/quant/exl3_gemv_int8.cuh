@@ -24,6 +24,9 @@ bool exl3_gemv_int8_msq_enabled();
 int exl3_gemv_int8_max_k(int device);
 
 // Returns true if the operation was handled (false -> caller should fall through to the regular kernel)
+// num_sms: the caller's SM count (exl3_gemm's force_num_sms override, 0 = hardware default). The sq
+// path sizes its grid and its slice height from it, so a non-zero value acts as a grid multiplier
+// for launch-geometry sweeps without touching code.
 bool exl3_gemv_int8
 (
     const at::Tensor& A,
@@ -32,6 +35,7 @@ bool exl3_gemv_int8
     const c10::optional<at::Tensor>& suh,
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
+    int num_sms,
     cudaStream_t stream,
     Graph* graph
 );

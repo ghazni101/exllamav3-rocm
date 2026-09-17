@@ -742,3 +742,259 @@ and the slice-major unit order inside `exl3_gemv_int8_msq_kernel` for plain mult
   pp-1.2 (bisect), batch-4 ~100 (cold-traffic measurement), chunk-size TTFT (sweep).
   The remaining live levers are T2 (GEMV efficiency — 525/210 GB/s at m=1) and P2 (prefill
   dequant/GEMM overlap).
+
+---
+
+## 11. Session 5: pure-AR speedup (no speculative decoding, no KV quant) — execution
+
+Branch `rocm-perf`, image `exllamav3-rocm:perf-a` (repo tree + the two new default-off knobs
+below). Scope: `ar-inference-speedup-plan` phases A–F. Every GPU number was taken on this host
+under the `~/gpu-coord` lock with the standing serve stopped.
+
+### 11.1 Phase A — the limiter, settled
+
+**A1. `profiling/dp4a_peak.hip` (new).** Standalone `hipcc --offload-arch=gfx1100` probe:
+ILP ∈ {1,2,4,8,16} independent chains, 256 threads, grid 192–1536, ≥10 reps after 3 warmups,
+wave32 (the wave the GEMV runs; `-mwavefrontsize64` is accepted by hipcc but the kernel still
+reports `warpSize=32`, so no wave64 arm is claimed). `v_dot4_i32_iu8` is what the extension's
+`__dp4a` lowers to (`__builtin_amdgcn_sudot4(true, a, false, b, c, false)`,
+`exllamav3_ext/hip_compat_hip.cuh:136`), and the ISA for every probe kernel was verified with
+`llvm-objdump` via `profiling/extract_isa.py` + `profiling/isa_dump.sh` (the SDK's `roc-obj-*`
+tools are broken: import error).
+
+| probe arm | measured |
+|---|---|
+| pure `v_dot4` (MODE 0), best (ILP=16, grid 768) | **240 G warp-dp4a/s** = 32×32 lanes × 240 G = 7.7 T lane-dp4a/s |
+| one IMAD per dp4a (MODE 1), best (ILP=8) | 93 G warp-dp4a/s / 186 G warp-inst/s → IMAD interference ≈ 0.39 |
+| per 8 dp4a: 1 LDS.128 + 8 IMAD (MODE 2) | 116 G warp-dp4a/s / 160 G warp-inst/s |
+| `v_fma_f32` chains (MODE 3) — issue calibration | **490 G warp-inst/s** (ILP=16, grid 384) |
+| `v_add_nc_u32` chains (MODE 4) | 264 G warp-inst/s |
+
+Two consequences, both of which change the plan's premises:
+
+1. **The schedulable issue ceiling on this part is ~476–490 G warp-instructions/s, not 953 G.**
+   HIP reports `multiProcessorCount = 48` (rocminfo prints `Compute Unit: 96`, an agent-level
+   count) and 4 SIMD32/CU; a VALU-only FMA loop reaches 490 G = 103 % of 48×4×2.482 GHz, so
+   48×4 IS the issue model. The plan's "4 SIMD/CU × 96 CU × 2.482 GHz = 953 G" double-counts.
+2. **`v_dot4` issues at half the FMA rate** (240 G vs 490 G per warp), i.e. ~1 per 2 cycles per
+   SIMD — not the 1/4 rate the earlier reasoning assumed implicitly, and not 1/cycle either.
+
+**A4. Instruction-mix accounting (installed extension, `isa_census.py` over 140 gfx1100 code
+objects).** Per (16 k-rows × 32 columns) unit row — 512 weights for every K — the innermost loop
+of each sq instantiation:
+
+| K | unit | bytes/row | insns | v_dot4 | v_mul_lo_u32 | extraction | loads |
+|---|---|---|---|---|---|---|---|
+| 4 | wide (M=1) | 256 | **84** | 16 | 16 | 22 | 1×global_b64 + 2×ds_load_b128 |
+| 4 | wide (M=4) | 256 | 167 | **64** | 16 | 22 | 1×global_b64 + 8×ds_load_b128 |
+| 3 | smem (M=1) | 192 | 82 | 16 | 16 | 22 | 4×ds_load* (+ separate cp.async staging loop) |
+| 5 | smem (M=1) | 320 | 104 | 16 | 16 | 36 | 6×ds_load_b32 |
+| 6 | narrow (M=1) | 384 | 98 | 16 | 16 | 32 | 8×global_load_b32 |
+
+So **one dp4a per 32 weights** (dp4a/byte = 0.25/K), not the "0.25 dp4a per weight" the plan
+assumed: **828 M warp-dp4a per token, not 6.6 G.** The plan's hypothesis that "6.6 G dp4a at the
+achieved rate ≈ 25 ms" explains the 34 ms token was arithmetically self-consistent but rested on
+a 32× over-count of dp4a per weight.
+
+**A5. Decision-rule outcome (recorded before Phase B).**
+`R_ach` = K=4 wide unit's dp4a rate = 525 GB/s × 0.0625 = **32.8 G warp-dp4a/s** (session-4
+cold-rotation figure). `R_peak` = **240 G warp-dp4a/s** (A1). Ratio **7.3 ≥ 1.4** →
+**B2 is granted**, and so are B1's unit-geometry levers.
+
+The honest reading, though, is narrower than "ALU headroom solves decode": the same wide unit
+also issues only 525 GB/s × 84/256 = **172 G warp-inst/s = 35 % of the ~490 G practical issue
+ceiling**, 13.7 % of the dp4a ceiling and 57 % of the ~919 GB/s DRAM peak. **No resource is
+saturated**; the sq GEMV is latency/MLP-bound, so the productive levers are outstanding-load
+count (prefetch depth, resident blocks) and fewer instructions per byte — not dp4a scheduling.
+
+**A2/A3 measurement harness — a correction that changes what the numbers mean.** The first A2/A3
+runs reported 1.1-4.4 TB/s, above the card's DRAM peak. Two defects, both fixed in
+`profiling/gemv_cold.py` + `profiling/sq_sweep1.py`:
+
+1. `rates()` divided the pool depth out of a per-call time that `bench()` had already divided —
+   every GB/s was inflated by exactly the rotation depth (6x in the first runs).
+2. **Arm state, not cache state, dominated multi-arm processes**: with all `force_num_sms` values in
+   one process, `sms=0` and `sms=48` (which resolve to the same `num_sms=48`, verified via
+   `ext.g_get_num_sms(0)`) differed by 2.2x on K=3 with tight within-arm min/max. One configuration
+   per process removes it, and the *whole* A3/B1 matrix below is one-config-per-process.
+
+The final protocol is: pool >= 6x the 96 MB Infinity Cache (20 same-shape layer instances, or all
+available), **no warm-up pass** — the first pass over the pool is the cold measurement — per-call
+event pairs, min/median/max reported, and the second pass reported separately as the warm contrast.
+Validated against production: the protocol's m=4/m=1 per-call ratio (3.6x, i.e. ~11% per-token
+amortization) predicts the in-model batch-4 aggregate (+9% over b1) that `bench_lean.py` measures.
+
+**A2/A3 cold rates (one config per process, (k=5120, n=17408), pool 267-891 MB):**
+
+| arm | K=3 m=1 | K=4 m=1 | K=4 m=4 | K=5 m=1 (17408x5120) |
+|---|---|---|---|---|
+| default geometry | 187.5 GB/s | 190-198 GB/s | 0.81-0.84 ms/call (3.6x m=1) | 275.6 GB/s |
+| EXL3_SQ_ROWS_PER=48 | **216.0** | **201.5** | - | - |
+| EXL3_SQ_ROWS_PER=32 | 214.5 | 205.9 | - | - |
+| EXL3_SQ_STAGE_SMEM=0 (narrow) | 204.7 | - | - | 299.2 |
+| EXL3_SQ_STAGE_SMEM=1 (staged) | 186.7 | - | - | 275.6 |
+| force_num_sms 24/48/64/96/128/192 @rp64 | 149-211 (flat above 64) | 195-201 (flat) | - | - |
+
+Two systematic facts fall out: the ROCm slice-height default (64) is ~6-10% slower than 48/32 on
+the K=3/4 sq kernels, and the smem-staged unit that the 3090 measurement favours is ~9% slower than
+the narrow unit on gfx1100 for both staged K (3, 5). Both are *kernel-level* wins; the plan's gate is
+end-to-end, and only one of them survives it:
+
+| `bench_lean.py` arm | decode b1 | b4 | b8 | prefill 2k |
+|---|---|---|---|---|
+| default (rp64) | 29.15 | 31.77 | 28.84 | 321.6 |
+| `EXL3_SQ_ROWS_PER=48` | **30.55 (+4.8%)** | 33.12 (+4.2%) | 28.96 | 324.0 |
+| `EXL3_SQ_STAGE_SMEM=0` | 29.61 (+1.6%) | 32.21 (+1.4%) | 28.92 | 324.5 |
+| both | 30.69 (+5.3%) | 32.79 (+3.2%) | 28.57 | 306.7 |
+
+**B1.1 shipped**: the ROCm slice-height default is now 48 (`exl3_gemv_int8.cu`, both the sq and msq
+launchers). **B1.2 not shipped**: forcing the narrow unit is +1.6% end-to-end — inside the +-3% bench
+spread, and it adds nothing on top of 48 — so the per-arch routing stays as tuned and the
+`EXL3_SQ_STAGE_SMEM` override is kept purely as an A/B knob. **B1.4 (raise `EXL3_INT8_GEMV_MAX_K` to
+6) is moot for this model**: the enumeration finds only 4 single-matrix K=6 instances (5120x1024,
+16 MB total); the other 164 K=6 tensors are the GDN projections, which are bundled and reach the
+kernel through the *msq* path, so a bigger sq K cap cannot reach them.
+
+
+### 11.2 Phase B/C — decode, and what batching is actually worth
+
+**B2 (K=4 wide unit, deeper row pipeline) — REFUTED, reverted.** The wide unit's per-kb-row body
+issues one global load with `s_waitcnt vmcnt(0)` in the installed ISA, so the plan's hypothesis was
+that its memory-level parallelism, not its dp4a rate, is the limiter and a deeper pipeline would
+fix it. Implemented as a row-register pipeline (template depth 2 -> 4 rows in flight, runtime
+selected) and measured cold at (5120,17408) K=4 m=1, one config per process, two runs each:
+**204.7 / 204.9 GB/s with the deeper pipeline vs 210.0 / 209.6 GB/s at the shipped depth** — 2.5%
+*slower*. End-to-end the deeper-pipeline arms also **hung the generator** (both arms; the two
+shipped-depth arms under the identical harness completed twice, with b1 31.63/31.62 tok/s). A
+change that is slower *and* hangs is reverted on both counts; the reasoning and the measurement are
+recorded at the patch site so it is not reintroduced.
+
+**B1/B2 end-to-end (perf-b = rows_per 48 defaults in both sq and msq launchers):**
+
+| bench_lean arm | b1 | b2 | b4 | b6 | b8 | prefill 2k |
+|---|---|---|---|---|---|---|
+| deployed / perf-a default (rp64) | 29.15 | - | 31.77 | - | 28.84 | 321.6 |
+| perf-a, `EXL3_SQ_ROWS_PER=48` | 30.55 | - | 33.12 | - | 28.96 | 324.0 |
+| **perf-b (rp48 default), run 1** | **31.63** | 34.91 | 32.76 | 23.16 | 32.50 | 323.8 |
+| **perf-b (rp48 default), run 2** | **31.62** | 34.91 | 32.74 | 23.19 | 32.60 | 323.8 |
+
+Two independent arms reproduce to 0.03%: **decode b1 31.63 tok/s vs 29.15 deployed (+8.5%)**, and the
+`msq` launcher's slice-height default matters too (the +4.8% from the sq knob alone grows to +8.5%
+once the msq path gets it, and the msq path is ~11% of b1 decode device time). The **b6 arm is an
+anomaly**: 6 concurrent requests aggregate *worse* than 8 (23.2 vs 32.6) — reproducible in both runs,
+so it is a scheduler/queue artifact of that concurrency level, not noise, and not something this
+session's changes touch (b2/b4/b8 are all monotone-sane).
+
+**B3 (non-GEMV decode time).** The session-2 CLI trace could not be mapped to a phase with
+confidence (clusters mix warmup, prefill, long-context and batch), so a pure-decode attribution is
+what the plan needs; it is prefigured by the per-launch averages the trace does give (int8 sq 78.3 us
+mean per launch, 247 launches/token at b1). B3.1-B3.3 were not attempted this session — see §11.5 for
+the remaining work and why the prefill lever was ranked above them.
+
+**B4 (`EXL3_INT8_GEMV=0`, fp16 QTIP GEMV) — negative, as it stands today.** Not a benchmark result:
+both attempts failed to complete (one died at model load, the second spun >10 min without producing a
+token). The fp16 GEMV path is default-off for a measured regression on Ampere-class parts and is not
+reachable in any shipped configuration, so the honest statement is "still worse, and not even
+run-to-completion on gfx1100" rather than a tok/s comparison. **Do not flip this knob.**
+
+### 11.3 Phase C — concurrency, measured
+
+**C1.** `bench_lean.py` now reports b2/b4/b6/b8 (and the eval above has them); the m-sweep of one
+layer shape is the one-config-per-process cold protocol of A2/A3.
+
+**C2 decision rule — per-call time scales ~m, so aggregate throughput is capped.** Cold
+(5120,17408) K=4: m=1 0.2342 ms, m=4 0.84 ms -> **3.6x for 4 rows** (11% per-token amortization),
+and the *same* protocol's warm pass gives 0.224/0.481 ms (2.15x), which is exactly the difference
+between an IC-resident and a DRAM-cold benchmark. In production, `bench_lean` b4 = 32.76 vs b1 31.63
+= **+3.6% aggregate at 4 concurrent** — the microbench's cold ratio predicts it, session-4's
+"cold sq@4 = 4.1x sq@1" measurement agrees, and the refuted msq-m>4 / coop-grid / batch-amortization
+routes stay refuted. **The honest serving ceiling for this model on this GPU is ~31-35 tok/s
+aggregate** (b1 31.6, b2 34.9, b4 32.8, b8 32.5), not the 150-250 the earlier plans hoped for: batching
+buys ~10% at best, because the weights must be re-streamed per row whatever the batch.
+
+**C3.** `soak.py` (10 min, mixed 1/2/4/8-job arrivals, 64-2048 token prompts) is part of the gate
+battery below; per-level batch behaviour is the b2/b4/b6/b8 rows above. `max_batch_size` was left at
+its configured value: the measured aggregate curve is flat-to-slightly-worse past b2, so raising it
+buys nothing and only widens the b6-style anomaly.
+
+### 11.4 Phase D — prefill and TTFT
+
+**D1 (`profiling/prefill_profile.py`, new) — the prefill question answered, and it is not a
+library.** One cold nonced 2048-token prefill, `torch.profiler(record_shapes=True)` over CPU+CUDA:
+
+| entry | device time | share | launches | per launch |
+|---|---|---|---|---|
+| `Cijk_Ailk_Bljk_HSS_BH_MT64x32x8_SE_1LDSB0_AMAS2_...` (hipBLAS Tensile) | 2853.5 ms | **68.2%** | 223 | 12.8 ms |
+| `Cijk_Ailk_Bljk_HHS_BH_MT128x128x16_MI16x16x16x1_...` | 468.7 ms | 11.2% | 142 | 3.3 ms |
+| `reconstruct_had_kernel<4,2>` | 105.3 ms | 2.5% | 296 | 0.36 ms |
+| `exl3_gemm_kernel<4,...>` (coop) | 78.4 ms | 1.9% | 108 | 0.73 ms |
+| `exl3_gemv_int8_sq_kernel<4,1,...>` | 17.2 ms | 0.4% | 216 | 0.08 ms |
+| everything else (elementwise, copy, attn/gdn, norms, hip launches) | <12% combined | | | |
+
+Total device 4182 ms for 2048 prompt tokens. The in-tree path (`exl3.py:161` reconstruct ->
+`hgemm_gemmex_impl` -> `cublasGemmEx(..., CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)`) is
+running **one poor Tensile configuration for two thirds of prefill**: 12.8 ms per launch on the
+dominant shape is **28.5 TFLOP/s** — the same number the earlier sessions kept re-deriving (28.7)
+in-model, and 3-6x below what this hardware measures on the same shapes in a clean loop (83.5-100).
+The gap is configuration selection inside the library call: not the fp16 round trip, not the
+reconstruct step (2.5% of device time), not allocation.
+
+**D2 (GEMM configuration matrix) — measurement incomplete, one fact established.**
+`profiling/d2_gemm_matrix.py` (new) compares `torch.matmul` fp16 / +reduced-precision-reduction /
+transposed across the model's prefill shapes under the rotated-buffer discipline. Its first run
+aborted on a shape bug in the transposed arm (since fixed) and the session budget did not allow a
+clean re-run, so **no per-shape configuration winner is claimed**. What it did show immediately:
+torch's backend on this stack is already hipBLASLt (`_BlasBackend.Cublaslt`), i.e. the clean-loop
+probes that reach 83-100 TFLOP/s are not using the same library as the ext's `cublasGemmEx` path -
+which strengthens "wrong config, not wrong library". The `EXL3_HGEMM_COMPUTE=f16` arm is
+unimplemented and unmeasured, so no numerical change was made and no KLD gate was needed.
+
+**D3/D4 (reconstruct overlap, chunk host gaps) — not attempted, and re-ranked.** D1 puts the
+reconstruct step at 2.5% of prefill device time (the plan's precondition for D3 was "if D1 shows the
+reconstruct step dominating the chunk wall") and everything outside the two hipBLAS kernels —
+including host gaps, norms, elementwise and the attention/GDN kernels — is under 12% combined. Both
+items are therefore secondary to fixing the dominant GEMM configuration.
+
+**D5/E1 (TTFT and long-context decode, perf-b, cold nonced prompts):**
+
+| context | decode tok/s | prefill tok/s | TTFT |
+|---|---|---|---|
+| 1 k | 31.16 | 229.5 | 4.53 s |
+| 4 k | 30.43 | 488.3 | 8.42 s |
+| 8 k | 29.27 | 454.2 | 18.07 s |
+| 16 k | 27.71 | 474.5 | 34.56 s |
+
+Decode loses 11% from 1 k to 16 k (0.23 tok/s per 1 k of context), i.e. paged-attention + GDN grow to
+roughly **10-11% of a token at 16 k**. The fp16 KV read at 32 k is 16 full-attn layers x 2 x 4 kv
+heads x 256 head_dim x 2 B x 32768 positions = 2.0 GB/token = 2.2 ms at the 919 GB/s practical peak
+(~6% of a token), so the ceiling on any attention-side win is that number. **E2 was not started**:
+its trigger (>10% share at 32 k) is borderline-met at 16 k, and `EXL3_CACHE_TOKENS=32768` cannot hold
+a 32 k prompt plus generated tokens at all (a 32 k-prompt run needs a larger cache - the first E1
+attempt hung there and is why `ctx_sweep.py` now caps at 16 k and prints each level as it completes).
+
+### 11.5 Status of every plan item
+
+| item | outcome |
+|---|---|
+| A1 dp4a peak | done: 240 G warp-dp4a/s pure, 490 G warp-inst/s FMA calibration; the plan's 953 G issue ceiling was 2x too high |
+| A2 per-K/m cold rates | done: K=3 187, K=4 190-198, K=5 276 GB/s at (5120,17408) m=1; m=4 costs 3.6x m=1 |
+| A3 geometry sweep | done: slice height 48/32 wins; force_num_sms above 64 is flat or worse; harness arm-order artifact found and eliminated |
+| A4 instruction mix | done: one dp4a per 32 weights (0.25/K per byte), not the 0.25 per weight the plan assumed |
+| A5 decision rule | R_peak/R_ach = 7.3 >= 1.4 -> B2 granted; B2 then refuted by measurement |
+| B1 K=3/5/6 | B1.1 shipped (slice height 48, both launchers); B1.2 not shipped (+1.6%); B1.4 moot (K=6 is bundled/msq) |
+| B2 K=4 wide unit | refuted: deeper pipeline 2.5% slower and hangs; reverted |
+| B3 non-GEMV | not attempted |
+| B4 fp16 GEMV | negative: does not run to completion |
+| C1/C2 | done: b2/b4/b6/b8 in bench_lean; m-scaling rule answered (ceiling ~31-35 tok/s) |
+| C3 | soak in the gate battery; batch curve flat past b2, max_batch_size unchanged |
+| D1 | done: hipBLAS Tensile config = 68% of prefill at 28.5 TFLOP/s |
+| D2 | measurement incomplete (shape-bug fix landed late); backend identified as hipBLASLt |
+| D3/D4 | not attempted, re-ranked behind D2 |
+| D5 | decode scaling measured to 16 k; TTFT at 1/4/8/16 k measured |
+| E1 | done (1-16 k) |
+| E2 | not started (trigger borderline; KV-bound upside ~6%) |
+
+**Shipped this session:** the ROCm slice-height default 48 in both the sq and msq int8 launchers
+(+8.5% b1, +3.1% b4, +1.3% b8, prefill unchanged), plus two default-off diagnostic knobs
+(`EXL3_SQ_STAGE_SMEM` unit routing, `force_num_sms` plumbing into the int8 path) that make the
+sweeps in this document reproducible without a rebuild.

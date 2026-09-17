@@ -187,7 +187,7 @@ int exl3_gemm_gr
     // to the regular kernel.
     if (mul1 && exl3_gemv_int8_enabled())
     {
-        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
+        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, force_num_sms, stream, graph))
             return 0;
     }
 
