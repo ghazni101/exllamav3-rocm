@@ -169,23 +169,20 @@ static bool exl3_gemv_int8_sq
 {
     if (size_m > 4) return false;
     int M = size_m > 2 ? 4 : size_m;
-    void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
-    if (!fn) return false;
-
-    int rows_max = gemv_int8_sq_rows_max(M, residual);
-
     // EXL3_SQ_ROWS_PER pins the slice height (multiple of 8, >= SQ_MINROWS). On RDNA3 the
     // single-wave rule's rows_per = rows_max starves occupancy on wide matrices (lm_head):
     // swept on gfx1101, 64 beats auto by ~19% decode e2e (32/48/96/128/256 all slower).
     // gfx1100 re-sweep (2026-09-17, model tensors, cold rotation): 48 beats 64 by ~6% on the
-    // K=3/4 sq kernels and +4.8% decode b1 / +4.2% b4 end-to-end, so 48 is the ROCm default.
+    // K=3/4 sq kernels and +4.8% decode b1 / +4.2% b4 end-to-end on the 4.0bpw model, so 48 was
+    // the ROCm default. Re-measured 2026-09-17 on Qwen3.8-27B-3.5bpw (4096/256, K6+narrow):
+    // rows_per=32 = 32.69 tok/s vs 48 = 32.00 (+2.2%), 24 = 31.31 (worse); 32 is the new default.
     static const int rows_per_env = []
     {
         const char* e = getenv("EXL3_SQ_ROWS_PER");
         return e ? atoi(e) : 0;
     }();
 #if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 48) + 7) & ~7, SQ_MINROWS);
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 32) + 7) & ~7, SQ_MINROWS);
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif
@@ -335,14 +332,14 @@ bool exl3_gemv_int8_msq
     int rows_max = gemv_int8_sq_rows_max(1, residual);
 
     // Mirror of the kernel's work decomposition (sq's single-wave rule over the max width);
-    // EXL3_SQ_ROWS_PER pins the slice height (default 64 on RDNA3 — swept on gfx1101)
+    // EXL3_SQ_ROWS_PER pins the slice height (ROCm default 32 — see sq path comment above)
     static const int rows_per_env = []
     {
         const char* e = getenv("EXL3_SQ_ROWS_PER");
         return e ? atoi(e) : 0;
     }();
 #if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 48) + 7) & ~7, SQ_MINROWS);
+    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 32) + 7) & ~7, SQ_MINROWS);
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif

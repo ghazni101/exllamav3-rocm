@@ -720,23 +720,26 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
 // are at the ALU floor / DRAM-bound, wide covers 4). That measurement is Ampere, never RDNA:
 // EXL3_SQ_STAGE_SMEM forces the sq kernel's choice per process for an A/B (0 = narrow, 1 = smem,
-// unset = this predicate). The B-stage region is reserved whenever either side could use it, so an
-// arm that forces smem on keeps the same shared-memory allocation as the arm that forces it on by
-// default (-1 = compile-time routing).
+// unset = this predicate). The B-stage region is reserved whenever either the compile-time routing
+// or an override can use it, so an arm that forces smem on keeps the same shared-memory allocation
+// as the arm that forces it on by default (-1 = compile-time routing).
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
+#if defined(USE_ROCM)
+    // gfx1100 e2e (Qwen3.8-27B-3.5bpw, 4096/256, 2026-09-17): EXL3_SQ_STAGE_SMEM=0 moved decode
+    // from 31.02 to 31.79 tok/s (+2.5%) with token parity. Prefer narrow; do not reserve the
+    // unused B-stage region either (frees LDS → occupancy). Override with EXL3_SQ_STAGE_SMEM=1.
+    (void) bits;
+    return false;
+#else
     return bits == 3 || bits == 5 || bits == 7;
+#endif
 }
 
 __host__ __device__ constexpr bool gemv_int8_reserve_stage(int bits, int stage_arg)
 {
     return gemv_int8_stage_smem(bits) || stage_arg == 1;
 }
-
-// NOTE (2026-09-17): the narrow unit measures ~9% faster than the smem-staged one on gfx1100 for
-// the staged K (3, 5) in the cold-rotation bench (profiling/sq_sweep1.py), but forcing it
-// end-to-end with EXL3_SQ_STAGE_SMEM=0 moved decode b1 by only +1.6% - inside bench noise - so the
-// per-arch default stays as tuned (staged for 3/5/7); the override is kept as an A/B knob.
 
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
 // striped over all warps of the grid. sh_tmp: 128 floats per warp.
