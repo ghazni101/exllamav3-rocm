@@ -111,7 +111,14 @@ def main():
         # covered end-to-end by the golden-token compare; running them here would drag the
         # chunked-prefill graph capture (and its autotune-during-capture fragility) into the
         # KLD gate.
-        prompts = [p for p in build_prompts(tok) if not p[0].startswith(("longctx", "prefix"))]
+        # NUMCHECK_LONG=1 is the numeric-change variant of this gate: a change that intentionally
+        # alters reconstruct-path numerics (e.g. EXL3_HGEMM_F16OUT, which rounds the fp32-output
+        # prefill GEMM result to fp16) is invisible to the short prompts, which never reach
+        # reconstruct_hgemm (AUTO_RECONSTRUCT_THRESHOLD = 144). Including the long prompts measures
+        # the KLD the change actually causes on the path it touches.
+        sel = os.environ.get("NUMCHECK_LONG") == "1"
+        prompts = [p for p in build_prompts(tok)
+                   if sel or not p[0].startswith(("longctx", "prefix"))]
         tokens, logits = {}, {}
         t0_ = time.time()
         for name, ids in prompts:

@@ -6,6 +6,7 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
+#include <vector>
 
 /*
 
@@ -16,81 +17,41 @@ Row-major matmul using cuBLAS, a @ b -> c
 
 using bfloat16 = __nv_bfloat16;
 
-#if defined(EXL3_HAVE_HIPBLASLT)
-#include <hipblaslt/hipblaslt.h>
-
-// Optional hipBLASLt path for the reconstruct/prefill GEMMs (EXL3_HGEMM_LT=1). The in-tree call is
-// hipBLAS cublasGemmEx(..., CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), which measures
-// 28.5 TFLOP/s in-model on the dominant prefill shape (k=5120, n=17408, m=2048) while hipBLASLt
-// reaches 99.6-107.8 TFLOP/s on the same shape with the same inputs and the same fp32 accumulation
-// (plan doc D1/D2). Same math, different library/algorithm selection. Default off: it ships only if
-// bench_lean moves and the logits KLD gate passes (the fp32-output callers in particular).
-static bool hgemm_lt_enabled()
+// The fp32-output reconstruct GEMM is the single largest prefill item: the model's q/k/v/gate/up
+// projections are built with out_dtype=torch.float (exllamav3/architecture/*.py), and on this stack
+// an fp16-input GEMM with an fp32 C/D (Tensile "HSS", MT64x32x8) runs at 18-19 TFLOP/s through
+// hipBLAS *and* hipBLASLt, against 92-103 TFLOP/s for the identical call with an fp16 C/D. Measured
+// cold-rotation at m=2048, the dominant shape (k=5120, n=17408): 20.07 ms fp32-out vs 4.14 ms
+// fp16-out-plus-convert - 4.85x (profiling/f32out_gemm_probe.py, plan doc D1).
+//
+// EXL3_HGEMM_F16OUT runs the GEMM into an fp16 slab and widens it (the accumulation stays fp32;
+// the only numeric change is one rounding of the result to fp16, the same precision the residual
+// stream already carries). Off by default: it ships only with the logits KLD gate.
+static bool hgemm_f16out_enabled()
 {
     static const bool on = []
     {
-        const char* e = getenv("EXL3_HGEMM_LT");
+        const char* e = getenv("EXL3_HGEMM_F16OUT");
         return e && atoi(e) != 0;
     }();
     return on;
 }
 
-// C[m,n] = A[m,k] @ B[n,k]^T with fp32 accumulation, all operands row-major; D may be fp16 or fp32.
-// Returns false (and leaves c untouched) if the library declines, so the caller can fall back.
-static bool hgemm_lt_impl
-(
-    const half* a_ptr, const half* b_ptr, void* c_ptr,
-    int size_m, int size_k, int size_n, int64_t c_stride_m,
-    bool output_fp32, cudaStream_t stream, void* ws, size_t ws_bytes
-)
+// Grow-only fp16 slab, one per device, sized on the first call. Deliberately a plain process-lifetime
+// allocation with a stable pointer: it is sized during the first (eager) call for a shape, so a
+// captured graph never sees it move.
+static at::Tensor hgemm_f16_scratch(const at::Tensor& c, int size_m, int size_n)
 {
-    hipblasLtHandle_t lt = nullptr;
-    if (hipblasLtCreate(&lt) != HIPBLAS_STATUS_SUCCESS) return false;
-
-    hipblasLtMatmulDesc_t desc = nullptr;
-    hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIPBLAS_R_32F);
-    hipblasOperation_t op_n = HIPBLAS_OP_N, op_t = HIPBLAS_OP_T;
-    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n));
-    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_t, sizeof(op_t));
-
-    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
-    hipblasLtMatrixLayoutCreate(&la, HIPBLAS_R_16F, size_m, size_k, size_k);
-    hipblasLtMatrixLayoutCreate(&lb, HIPBLAS_R_16F, size_n, size_k, size_k);
-    hipblasLtMatrixLayoutCreate(&lc, output_fp32 ? HIPBLAS_R_32F : HIPBLAS_R_16F,
-                                size_m, size_n, (int) c_stride_m);
-    hipblasLtOrder_t row = HIPBLASLT_ORDER_ROW;
-    hipblasLtMatrixLayoutSetAttribute(la, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
-    hipblasLtMatrixLayoutSetAttribute(lb, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
-    hipblasLtMatrixLayoutSetAttribute(lc, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
-
-    hipblasLtMatmulPreference_t pref = nullptr;
-    hipblasLtMatmulPreferenceCreate(&pref);
-    size_t ws_max = ws_bytes;
-    hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                          &ws_max, sizeof(ws_max));
-    hipblasLtMatmulHeuristicResult_t heur;
-    int found = 0;
-    bool ok = hipblasLtMatmulAlgoGetHeuristic(lt, desc, la, lb, lc, lc, pref, 1, &heur, &found)
-              == HIPBLAS_STATUS_SUCCESS && found > 0;
-    if (ok)
-    {
-        float alpha = 1.0f, beta = 0.0f;
-        ok = hipblasLtMatmul(lt, desc, &alpha, a_ptr, la, b_ptr, lb, &beta,
-                             c_ptr, lc, c_ptr, lc, &heur.algo, ws, ws_bytes, stream)
-             == HIPBLAS_STATUS_SUCCESS;
-        // The heuristic may return an algorithm that needs more workspace than offered; in that
-        // case the call above fails and the caller falls back rather than producing a wrong result.
-    }
-
-    hipblasLtMatmulPreferenceDestroy(pref);
-    hipblasLtMatrixLayoutDestroy(la);
-    hipblasLtMatrixLayoutDestroy(lb);
-    hipblasLtMatrixLayoutDestroy(lc);
-    hipblasLtMatmulDescDestroy(desc);
-    hipblasLtDestroy(lt);
-    return ok;
+    static std::vector<at::Tensor> scratch;
+    int device = c.get_device();
+    if ((int) scratch.size() <= device) scratch.resize(device + 1);
+    at::Tensor& s = scratch[device];
+    int64_t numel = (int64_t) size_m * (int64_t) size_n;
+    if (!s.defined() || s.numel() < numel)
+        s = at::empty({numel}, c.options().dtype(at::kHalf));
+    return s;
 }
-#endif
+
 
 static void hgemm_gemmex_impl
 (
@@ -126,22 +87,6 @@ static void hgemm_gemmex_impl
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
-#if defined(EXL3_HAVE_HIPBLASLT)
-    if (hgemm_lt_enabled())
-    {
-        int device_id;
-        cudaGetDevice(&device_id);
-        void* lt_ws = DevCtx::instance().get_ws(device_id);
-        if (hgemm_lt_impl(a_ptr, b_ptr, c.data_ptr(), size_m, size_k, size_n, c_stride_m,
-                          output_fp32, stream, lt_ws, WORKSPACE_SIZE))
-        {
-            cuda_check(cudaPeekAtLastError());
-            return;
-        }
-        cudaGetLastError();     // clear a declined-call error before the fallback path runs
-    }
-#endif
-
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);
@@ -154,6 +99,28 @@ static void hgemm_gemmex_impl
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+
+    if (output_fp32 && hgemm_f16out_enabled())
+    {
+        // Same call, fp16 destination, then widen into c (which may be a strided slice view)
+        at::Tensor scratch = hgemm_f16_scratch(c, size_m, size_n);
+        auto r16 = cublasGemmEx
+        (
+            cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            size_n, size_m, size_k,
+            &alpha_, b_ptr, CUDA_R_16F, size_n,
+                     a_ptr, CUDA_R_16F, size_k,
+            &beta_,  scratch.data_ptr(), CUDA_R_16F, size_n,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+        cublas_check(r16);
+        cuda_check(cudaPeekAtLastError());
+        c.copy_(scratch.view({size_m, size_n}));
+        return;
+    }
+
     auto r = cublasGemmEx
     (
         cublas_handle,

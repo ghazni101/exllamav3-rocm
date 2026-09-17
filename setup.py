@@ -36,31 +36,6 @@ else:
         "-Xcudafe", "--diag_suppress=20012",
     ]
 
-# Optional hipBLASLt GEMM path (hgemm.cu, EXL3_HGEMM_LT=1). The ROCm SDK in this layout ships the
-# hipBLASLt headers under the pip "rocm-sdk devel" package rather than /opt/rocm/include, so the
-# include and library dirs are probed; if the header is absent the source falls back to the in-tree
-# hipBLAS call (no hard dependency).
-hipblaslt_include_dirs = []
-hipblaslt_libs = []
-if is_hip:
-    import glob
-    _cands = [os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "include")]
-    _cands += sorted(glob.glob("/opt/rocm-venv/lib/python3.12/site-packages/_rocm_sdk_*/include"))
-    for _d in _cands:
-        if os.path.exists(os.path.join(_d, "hipblaslt", "hipblaslt.h")):
-            hipblaslt_include_dirs = [_d]
-            extra_cuda_cflags += ["-DEXL3_HAVE_HIPBLASLT"]
-            _libs = sorted(glob.glob(os.path.join(os.path.dirname(_d), "lib", "libhipblaslt.so*")))
-            _libdirs = sorted(glob.glob(os.path.join(os.path.dirname(_d), "*", "lib", "libhipblaslt.so*")))
-            if _libdirs:
-                hipblaslt_libs = ["-L" + os.path.dirname(_libdirs[0]), "-lhipblaslt"]
-            elif _libs:
-                hipblaslt_libs = ["-L" + os.path.dirname(_libs[0]), "-lhipblaslt"]
-            print(f"hipBLASLt GEMM path enabled: include={_d} libs={hipblaslt_libs}")
-            break
-    if not hipblaslt_include_dirs:
-        print("hipBLASLt headers not found: EXL3_HGEMM_LT will be unavailable")
-
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
     # std::min/std::max call site parsed after it (WIN32_LEAN_AND_MEAN does not suppress them).
@@ -107,13 +82,12 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
-                include_dirs=[sources_dir] + hipblaslt_include_dirs,
+                include_dirs=[sources_dir],
                 libraries=(
                     ["hipblas"] if is_hip else
                     ["cublas"] if windows else
                     []
                 ),
-                extra_link_args=hipblaslt_libs,
             )
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},
