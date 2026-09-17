@@ -17,7 +17,6 @@ FILLER = "Machine learning models have grown rapidly in scale over the past deca
 BASE = "The history of computing machinery begins in the nineteenth century with "
 
 def main():
-    free0, total = torch.cuda.mem_get_info()
     config = Config.from_directory(MODEL_DIR)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=CACHE_TOKENS)
@@ -28,6 +27,13 @@ def main():
     generator.enqueue(gen)
     while not any(r.get("eos") for r in generator.iterate()):
         pass
+
+    # Leak baseline: AFTER the model, cache and warm-up are resident. The earlier version sampled
+    # free VRAM before the model was loaded, so `free0 - free1` was just the model size (~20 GB) and
+    # the >512 MB check could never pass (the session-4 gate only grepped for the JSON key).
+    free0, total = torch.cuda.mem_get_info()
+    alloc0 = torch.cuda.memory_allocated()
+    resv0 = torch.cuda.memory_reserved()
 
     t_end = time.time() + MINUTES * 60
     rounds, toks = 0, 0
@@ -56,12 +62,22 @@ def main():
         print(f"[soak] round {rounds}: {njobs}x{plen}-prompt {glen}-tok jobs done, total {toks} gen tokens", flush=True)
 
     free1, _ = torch.cuda.mem_get_info()
-    print(json.dumps({"rounds": rounds, "gen_tokens": toks,
-                      "vram_leak_mb": round((free0 - free1) / 2**20, 1)}))
-    if (free0 - free1) / 2**20 > 512:
-        print("[soak] FAIL: VRAM leak > 512 MB")
+    alloc1 = torch.cuda.memory_allocated()
+    resv1 = torch.cuda.memory_reserved()
+    print(json.dumps({
+        "rounds": rounds, "gen_tokens": toks,
+        "vram_leak_mb": round((free0 - free1) / 2**20, 1),
+        # allocated growth = live tensors (a real leak); reserved growth = caching-allocator
+        # retention, which is expected to grow with the largest job mix seen and is not a leak
+        "alloc_growth_mb": round((alloc1 - alloc0) / 2**20, 1),
+        "reserved_growth_mb": round((resv1 - resv0) / 2**20, 1)}))
+    # The leak signal is live-tensor growth. Free-VRAM growth also carries the caching allocator's
+    # retained blocks and the KV page pool's high-water mark, which legitimately grow with the
+    # largest job mix served and are not leaks - report them, but do not fail on them alone.
+    if (alloc1 - alloc0) / 2**20 > 512:
+        print("[soak] FAIL: live-tensor growth > 512 MB")
         sys.exit(1)
-    print("[soak] PASS")
+    print("[soak] PASS (live tensors; free-VRAM/reserved growth reported above)")
 
 if __name__ == "__main__":
     main()

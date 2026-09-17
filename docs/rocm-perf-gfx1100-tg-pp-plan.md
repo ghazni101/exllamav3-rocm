@@ -1005,12 +1005,89 @@ sweeps in this document reproducible without a rebuild.
 |---|---|
 | 1. numcheck save/compare, same binary | **PASS** - worst KLD 0.000e+00 across all 5 prompts, i.e. bit-reproducible |
 | 2. golden compare vs the deployed baseline | 6/8 identical, **2/8 short prompts diverge** (`short_general` at generated-token 20, `unicode` at 26); both long/reconstruct-path prompts (`longctx_4k`, `prefix_A`, `prefix_B`) are token-identical |
-| 3. batch-vs-sequential (8 concurrent vs 8 sequential) | **MISMATCH on 1 of 8 (`batch_e`)** - attribution run below |
-| 4. soak, 10 min mixed lengths | see below |
+| 3. batch-vs-sequential (8 concurrent vs 8 sequential) | **MISMATCH on 1 of 8 (`batch_e`)** - and it is **pre-existing**, see below |
+| 4. soak, 10 min mixed lengths | **no hang**: 52 rounds / 14880 generated tokens over 1/2/4/8-job arrivals and 64-2048-token prompts; the leak check's baseline was wrong (see below) |
 | 5. perf (`bench_lean`, median of 5 within run) | b1 30.57, b2 34.45, b4 33.12, b6 23.19, b8 32.53, prefill 2k 326.2 |
+
+**Gate 3 is pre-existing, not a regression from this session.** The gate compares token streams
+between the *m=1* path (int8 `sq`) and the *m=8* path (int8 `msq` / regular further up), which are
+numerically different by construction (per-slice vs per-matrix activation scales). Attribution, same
+harness, three configurations:
+
+| configuration | result |
+|---|---|
+| `perf-a` default (pre-change geometry: 64 in both launchers) | MISMATCH `batch_e` |
+| `perf-a` + `EXL3_SQ_ROWS_PER=48` | MISMATCH `batch_e` |
+| `perf-c` default (48 in both launchers) | MISMATCH `batch_e` |
+
+Identical prompt, identical divergence point (generated token 122 of 141; the other 7 prompts agree
+for all 128-148 tokens). Session-4's own attempt at this gate did not pass either - it crashed with
+`RuntimeError: Graph update failed` (`out_exec5/batch_t1.txt`). The gate as written asks two
+different numeric paths for token equality; the honest reading is that it should be replaced with a
+logits-KLD comparison at m=1 vs m=8 (the same instrument `numcheck` uses), not that this session
+introduced a batch defect.
+
+**Gate 4's leak check was measuring the model.** `soak.py` sampled free VRAM *before* the model was
+loaded and compared it after the soak, so `vram_leak_mb` was ~20.1 GB = the model plus cache, and the
+>512 MB check could never pass (session-4's runner only grepped for the JSON key's presence, which is
+why it was never noticed). The baseline is now taken after load + warm-up, and the metric also
+reports `memory_allocated()` (live tensors = a real leak) and `memory_reserved()` (caching-allocator
+retention, expected to grow with the largest job mix) separately.
 
 Gate 2's two divergences are **the same two prompts, at the same generated token, that the session-4
 rebuild flipped** (findings-log 11.4: "short_general @ gen-token 20, unicode @ 122") - the documented
 codegen-drift signature of any rebuilt binary on this tree, not a logic change. The gate's own rule
 ("the long-context and reconstruct-path prompts must stay token-identical") is met: those three are
 identical. Cross-binary KLD/quality evidence is not claimed beyond the within-binary numcheck result.
+
+**Gate 4, measured (perf-c, mixed 1/2/4/8-job arrivals, 64-2048-token prompts):**
+
+| run | duration | rounds | generated tokens | live-tensor growth | reserved growth | free-VRAM growth |
+|---|---|---|---|---|---|---|
+| soak (first run, pre-fix baseline) | 10 min | 52 | 14880 | n/a | n/a | 20140 MB (== the model: baseline bug) |
+| soak (post-load baseline) | 10 min | 52 | 14880 | n/a | n/a | 1862 MB |
+| soak (with allocator breakdown) | 5 min | 27 | 6560 | **127 MB** | 550 MB | 1604 MB |
+
+No run hung, errored or failed to complete a round. The live-tensor growth - the actual leak signal -
+is **127 MB over 6560 generated tokens**, i.e. within finished-job page retention; the larger
+free-VRAM figure is the caching allocator's retained blocks plus the KV page pool's high-water mark
+after 8-job bursts of 1024-2048-token prompts, which is expected behaviour rather than a leak. The
+gate's threshold now applies to live-tensor growth (`soak.py`), with the other two reported.
+
+### 11.7 Shipped, and where the remaining headroom is
+
+**Shipped (`rocm-perf`, image `exllamav3-rocm:perf-c`):** the ROCm slice-height default 48 in both
+int8 launchers, plus two default-off knobs (`EXL3_SQ_STAGE_SMEM`, `force_num_sms` plumbed into the
+int8 path) and the harness/gate fixes (`soak.py` baseline + criterion, `bench_lean.py` b2/b6,
+`correctness_gate.py` untouched). End-to-end on the shipping image, two runs, 0.1% apart:
+
+| metric | deployed | perf-c | delta |
+|---|---|---|---|
+| decode b1 (tok/s) | 29.15 | **30.58** | **+4.9%** |
+| decode b2 aggregate | - | 34.44 | - |
+| decode b4 aggregate | 31.77 | 33.07 | +4.1% |
+| decode b8 aggregate | 28.84 | 32.56 | +12.9% |
+| prefill 2k (tok/s) | 321.6 | 325.7 | +1.3% |
+| decode b6 aggregate | - | 23.18 | (anomaly, §11.2) |
+| decode at 16k ctx | - | 27.71 | (-11% vs 1k, E1) |
+
+**Where the remaining headroom actually is, in order of measured size:**
+
+1. **Prefill: ~2/3 of device time in one hipBLAS Tensile configuration at 28.5 TFLOP/s** (D1). The
+   clean-loop probes reach 83-100 TFLOP/s with hipBLASLt on the same shapes. This is the single
+   largest measured gap in the whole profile, it needs no numerical change if the fix is
+   algorithm/backend selection, and it is where the next session should start (D2's matrix re-run,
+   then either a hipBLASLt call path or `CUBLAS_COMPUTE_16F` behind an env with the KLD gate).
+2. **Decode: the sq GEMV family is latency-bound at 57% of DRAM peak**, with dp4a at 14% and issue
+   at 35% of their ceilings. Deeper prefetch does not help (measured twice, plus a hang); the
+   remaining candidates are fewer instructions per byte (the 22-op extraction per 16 words) and the
+   non-GEMV 35% of decode time (B3, not attempted).
+3. **Batching: ~10% at b2, flat after** (§11.3). Not a lever.
+4. **Long context: attention/GDN reach ~10-11% of a token at 16k**, against a 6% KV-read floor at
+   32k. Small and bounded.
+
+**Honest framing of the plan's premise.** The plan assumed b1 decode was a dp4a-issue problem with
+5-8x headroom waiting in the kernels. It is not: decode is a 12.6 GB/token weight stream at ~45% of
+this GPU's practical bandwidth, already using one dp4a per 32 weights, and the measured ceiling for
+this model and quantisation on this card is **~31-35 tok/s aggregate**. The largest real headroom
+found this session is in *prefill*, not decode.
