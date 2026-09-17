@@ -16,6 +16,82 @@ Row-major matmul using cuBLAS, a @ b -> c
 
 using bfloat16 = __nv_bfloat16;
 
+#if defined(EXL3_HAVE_HIPBLASLT)
+#include <hipblaslt/hipblaslt.h>
+
+// Optional hipBLASLt path for the reconstruct/prefill GEMMs (EXL3_HGEMM_LT=1). The in-tree call is
+// hipBLAS cublasGemmEx(..., CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), which measures
+// 28.5 TFLOP/s in-model on the dominant prefill shape (k=5120, n=17408, m=2048) while hipBLASLt
+// reaches 99.6-107.8 TFLOP/s on the same shape with the same inputs and the same fp32 accumulation
+// (plan doc D1/D2). Same math, different library/algorithm selection. Default off: it ships only if
+// bench_lean moves and the logits KLD gate passes (the fp32-output callers in particular).
+static bool hgemm_lt_enabled()
+{
+    static const bool on = []
+    {
+        const char* e = getenv("EXL3_HGEMM_LT");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// C[m,n] = A[m,k] @ B[n,k]^T with fp32 accumulation, all operands row-major; D may be fp16 or fp32.
+// Returns false (and leaves c untouched) if the library declines, so the caller can fall back.
+static bool hgemm_lt_impl
+(
+    const half* a_ptr, const half* b_ptr, void* c_ptr,
+    int size_m, int size_k, int size_n, int64_t c_stride_m,
+    bool output_fp32, cudaStream_t stream, void* ws, size_t ws_bytes
+)
+{
+    hipblasLtHandle_t lt = nullptr;
+    if (hipblasLtCreate(&lt) != HIPBLAS_STATUS_SUCCESS) return false;
+
+    hipblasLtMatmulDesc_t desc = nullptr;
+    hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIPBLAS_R_32F);
+    hipblasOperation_t op_n = HIPBLAS_OP_N, op_t = HIPBLAS_OP_T;
+    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n));
+    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_t, sizeof(op_t));
+
+    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    hipblasLtMatrixLayoutCreate(&la, HIPBLAS_R_16F, size_m, size_k, size_k);
+    hipblasLtMatrixLayoutCreate(&lb, HIPBLAS_R_16F, size_n, size_k, size_k);
+    hipblasLtMatrixLayoutCreate(&lc, output_fp32 ? HIPBLAS_R_32F : HIPBLAS_R_16F,
+                                size_m, size_n, (int) c_stride_m);
+    hipblasLtOrder_t row = HIPBLASLT_ORDER_ROW;
+    hipblasLtMatrixLayoutSetAttribute(la, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
+    hipblasLtMatrixLayoutSetAttribute(lb, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
+    hipblasLtMatrixLayoutSetAttribute(lc, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
+
+    hipblasLtMatmulPreference_t pref = nullptr;
+    hipblasLtMatmulPreferenceCreate(&pref);
+    size_t ws_max = ws_bytes;
+    hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                          &ws_max, sizeof(ws_max));
+    hipblasLtMatmulHeuristicResult_t heur;
+    int found = 0;
+    bool ok = hipblasLtMatmulAlgoGetHeuristic(lt, desc, la, lb, lc, lc, pref, 1, &heur, &found)
+              == HIPBLAS_STATUS_SUCCESS && found > 0;
+    if (ok)
+    {
+        float alpha = 1.0f, beta = 0.0f;
+        ok = hipblasLtMatmul(lt, desc, &alpha, a_ptr, la, b_ptr, lb, &beta,
+                             c_ptr, lc, c_ptr, lc, &heur.algo, ws, ws_bytes, stream)
+             == HIPBLAS_STATUS_SUCCESS;
+        // The heuristic may return an algorithm that needs more workspace than offered; in that
+        // case the call above fails and the caller falls back rather than producing a wrong result.
+    }
+
+    hipblasLtMatmulPreferenceDestroy(pref);
+    hipblasLtMatrixLayoutDestroy(la);
+    hipblasLtMatrixLayoutDestroy(lb);
+    hipblasLtMatrixLayoutDestroy(lc);
+    hipblasLtMatmulDescDestroy(desc);
+    hipblasLtDestroy(lt);
+    return ok;
+}
+#endif
+
 static void hgemm_gemmex_impl
 (
     at::Tensor a,
@@ -49,6 +125,22 @@ static void hgemm_gemmex_impl
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
+
+#if defined(EXL3_HAVE_HIPBLASLT)
+    if (hgemm_lt_enabled())
+    {
+        int device_id;
+        cudaGetDevice(&device_id);
+        void* lt_ws = DevCtx::instance().get_ws(device_id);
+        if (hgemm_lt_impl(a_ptr, b_ptr, c.data_ptr(), size_m, size_k, size_n, c_stride_m,
+                          output_fp32, stream, lt_ws, WORKSPACE_SIZE))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return;
+        }
+        cudaGetLastError();     // clear a declined-call error before the fallback path runs
+    }
+#endif
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
