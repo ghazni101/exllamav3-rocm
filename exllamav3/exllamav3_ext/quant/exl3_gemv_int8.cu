@@ -169,6 +169,11 @@ static bool exl3_gemv_int8_sq
 {
     if (size_m > 4) return false;
     int M = size_m > 2 ? 4 : size_m;
+    void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
+    if (!fn) return false;
+
+    int rows_max = gemv_int8_sq_rows_max(M, residual);
+
     // EXL3_SQ_ROWS_PER pins the slice height (multiple of 8, >= SQ_MINROWS). On RDNA3 the
     // single-wave rule's rows_per = rows_max starves occupancy on wide matrices (lm_head):
     // swept on gfx1101, 64 beats auto by ~19% decode e2e (32/48/96/128/256 all slower).
