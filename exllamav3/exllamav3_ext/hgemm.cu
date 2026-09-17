@@ -16,24 +16,6 @@ Row-major matmul using cuBLAS, a @ b -> c
 
 using bfloat16 = __nv_bfloat16;
 
-// EXL3_HGEMM_ATEN=1 routes this fp16 GEMM through ATen's matmul instead of the in-tree
-// cublasGemmEx(..., CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) call. On this ROCm stack ATen
-// dispatches to hipBLASLt, which measures 99.6-107.8 TFLOP/s on the model's own prefill shapes
-// (m=2048) where the cublasGemmEx path measures 28.5 in-model - a 3.7x gap on identical shapes
-// (docs/rocm-perf-gfx1100-tg-pp-plan.md D1/D2). Diagnostic and default-off until it passes the same
-// gates as the incumbent path (numeric KLD + bench_lean), and it is not graph-capture safe in
-// general: ATen may allocate for the reduction workspace, so captured callers must stay on the
-// incumbent path.
-static bool hgemm_aten_enabled()
-{
-    static const bool on = []
-    {
-        const char* e = getenv("EXL3_HGEMM_ATEN");
-        return e && atoi(e) != 0;
-    }();
-    return on;
-}
-
 static void hgemm_gemmex_impl
 (
     at::Tensor a,
@@ -67,24 +49,6 @@ static void hgemm_gemmex_impl
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
-
-    if (hgemm_aten_enabled())
-    {
-        // C[m,n] = A[m,k] @ B[n,k]^T, with C's row stride possibly larger than n. ATen needs a
-        // contiguous 2D output, so a strided c goes through a temporary.
-        at::Tensor a2 = a.reshape({(int64_t) size_m, (int64_t) size_k});
-        at::Tensor bt = b.transpose(0, 1);
-        bool direct = (c_stride_m == size_n) && c.is_contiguous();
-        at::Tensor c2 = direct ? c.reshape({(int64_t) size_m, (int64_t) size_n})
-                               : at::empty({(int64_t) size_m, (int64_t) size_n}, c.options());
-        bool rpr = at::globalContext().allowFP16ReducedPrecisionReduction();
-        at::globalContext().setAllowFP16ReducedPrecisionReduction(false);
-        at::mm_out(c2, a2, bt);
-        at::globalContext().setAllowFP16ReducedPrecisionReduction(rpr);
-        if (!direct) c.copy_(c2.reshape(c.sizes()));
-        cuda_check(cudaPeekAtLastError());
-        return;
-    }
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();

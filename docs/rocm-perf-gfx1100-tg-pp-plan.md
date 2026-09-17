@@ -1118,3 +1118,34 @@ rule is that a change ships only if the end-to-end metric moves on its own build
 allocate a reduction workspace, which is not safe inside the captured decode graphs - so the
 incumbent path stays the default until the A/B below is green. Measured outcome of that A/B:
 see §11.8.
+
+**D2 implementation attempt (perf-d/perf-e, `exllamav3_ext/hgemm.cu`) - ATTEMPTED, NOT SHIPPED,
+REVERTED.** The env-gated route through `at::mm_out` was built twice and run against the real model.
+Both builds succeeded and the incumbent path was measurably unaffected (default arm on perf-d:
+b1 30.49 / prefill 326.0; on perf-e: 30.51 / 326.9 - within 0.3% of perf-c on every metric), but the
+ATen arm never completed a run. Two concrete, independent failures, in order:
+
+```
+    ext.hgemm_recon(xh, w, y_)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (2048x5120 and 10240x5120)
+```
+
+The cause was my own transpose: `hgemm`'s `b` is already `(k, n)` row-major (its header comment says
+"a @ b -> c"), so the extra `b.transpose(0, 1)` produced `(n, k)` and the shapes stopped matching.
+   Fixed by calling `at::mm_out(c2, a2, b)` directly (perf-e).
+
+2. `RuntimeError: Expected out tensor to have dtype c10::Half, but got float instead` - again from
+   `hgemm_recon`, and this one is structural rather than a bug: **`hgemm_recon` runs with fp32
+   output** (`exl3.py:198`, `default_out_dtype`), and ATen's `mm`/`mm_out` require operands and
+   output to share one dtype, so fp16 x fp16 -> fp32 is not expressible through it. The route is
+   therefore the wrong tool for the call site that matters most: the fp16-output callers could use
+   it (with an fp16 accumulate), but the fp32-output ones need a real hipBLASLt call with
+   `compute_type = 32F` and `D = 32F`.
+
+Both attempts are reverted; the tree carries no half-working GEMM path. What remains established for
+the follow-up: the ATen/hipBLASLt entry point *is* reached exactly at `hgemm_recon` (so a hipBLASLt
+call there will be exercised by the prefill path), the incumbent path is untouched by the presence of
+an alternative, and the prize is 3.7x on the shape that is 68% of prefill device time. The remaining
+work is a direct hipBLASLt integration - descriptors with `HIPBLASLT_ORDER_ROW` layouts, a
+`HIPBLAS_OP_T` on the (n, k) operand, `hipblasLtMatmulAlgoGetHeuristic` with the 16 MB workspace
+`DevCtx` already exposes, and the KLD gate on the fp32-output layers - not an ATen detour.
