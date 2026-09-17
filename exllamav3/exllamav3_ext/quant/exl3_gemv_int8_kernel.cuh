@@ -218,24 +218,6 @@ __device__ __forceinline__ void extract8_4bits_words(uint32_t a, uint32_t b,
 }
 
 
-// 3bpw extraction from two already-loaded circular-buffer words (same window order as ext8w<3>)
-__device__ __forceinline__ void extract8_3bits_words(uint32_t a, uint32_t b, int s2,
-    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
-    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7)
-{
-    constexpr int bits = 3;
-    w7 = fshift(b, a, s2);
-    w6 = w7 >> bits;
-    w5 = w6 >> bits;
-    w4 = w5 >> bits;
-    w3 = fshift(b, a, s2 + bits * 4);
-    w2 = w3 >> bits;
-    w1 = w2 >> bits;
-    w0 = w1 >> bits;
-    w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
-    w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
-}
-
 // ---------------------------------------------------------------------------------------------------------
 // Device building blocks (also reusable from batched mgemm/MoE-style kernels)
 
@@ -679,158 +661,9 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
 }
 
-// K=3 register-pipelined unit (A15): ROCm's cp.async is a synchronous 16 B copy, so the smem-staged
-// unit pays an LDS round-trip with no overlap and loses to narrow on gfx1100. Mirror the K=4 wide
-// unit instead: coalesced global loads into VGPRs (48 u32 = 192 B per warp-row), shuffle to the
-// two words ext8w<3> needs, extract in-registers, two-row prefetch. Selected for bits==3 in place
-// of narrow/smem. Straight-line body (no device lambdas) — HIP hung the lambda version.
-template <int M, bool residual, bool atomic = true>
-__device__ __forceinline__ void gemv_int8_unit_k3
-(
-    const uint16_t* __restrict__ B,
-    int* __restrict__ accs,
-    size_t acc_stride,
-    const uint32_t* __restrict__ sh_as,
-    int slice_stride,
-    int nb256,
-    int kb0,
-    int nrows,
-    int size_n,
-    int ncols
-)
-{
-    constexpr int bits = 3;
-    constexpr int pairwords = 16 * bits;          // 48 u32 per adjacent block pair
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int nbp = nb256 * 8 + warp;
-    if (nbp * 32 >= ncols) return;
-    const int row_stride = size_n * bits / 2;
-    const uint32_t* bp0 = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
-
-    int t0 = lane << 3;
-    int b1 = (t0 + 257) * bits;
-    int b0 = b1 - 16;
-    int b2e = b1 + bits * 7;
-    int i0 = wrap_idx<bits>(b0 / 32);
-    int i2 = wrap_idx<bits>((b2e - 1) / 32);
-    int s2 = (((b2e - 1) / 32) + 1) * 32 - b2e;
-    // s2 from unwrapped i2 boundary (matches ext8w<3>); i0/i2 already wrapped to [0,24)
-
-    int c2 = 2 * (lane & 3);
-    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
-    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
-
-    uint32_t lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
-    if (nrows > 0)
-    {
-        const uint32_t* row = bp0;
-        lo0 = row[lane];
-        hi0 = (lane < 16) ? row[32 + lane] : 0u;
-    }
-    if (nrows > 1)
-    {
-        const uint32_t* row = bp0 + row_stride;
-        lo1 = row[lane];
-        hi1 = (lane < 16) ? row[32 + lane] : 0u;
-    }
-
-    for (int kb = 0; kb < nrows; ++kb)
-    {
-        uint32_t lo2 = 0, hi2 = 0;
-        if (kb + 2 < nrows)
-        {
-            const uint32_t* row = bp0 + (size_t) (kb + 2) * row_stride;
-            lo2 = row[lane];
-            hi2 = (lane < 16) ? row[32 + lane] : 0u;
-        }
-
-        // blockA words via shuffle from lo (pair words 0..23 live in lanes 0..23)
-        uint32_t a0 = __shfl_sync(0xffffffff, lo0, i0);
-        uint32_t a1 = __shfl_sync(0xffffffff, lo0, i2);
-        // blockB words: pair 24..47 → lo lanes 24..31 and hi lanes 0..15.
-        // BOTH shfls must execute on every lane — a divergent ternary around
-        // __shfl_sync deadlocks the warp (A15 hang).
-        int g0 = i0 + 24, g2 = i2 + 24;
-        uint32_t b0_lo = __shfl_sync(0xffffffff, lo0, (g0 < 32) ? g0 : 0);
-        uint32_t b0_hi = __shfl_sync(0xffffffff, hi0, (g0 >= 32) ? (g0 - 32) : 0);
-        uint32_t b1_lo = __shfl_sync(0xffffffff, lo0, (g2 < 32) ? g2 : 0);
-        uint32_t b1_hi = __shfl_sync(0xffffffff, hi0, (g2 >= 32) ? (g2 - 32) : 0);
-        uint32_t b0w = (g0 < 32) ? b0_lo : b0_hi;
-        uint32_t b1w = (g2 < 32) ? b1_lo : b1_hi;
-
-        uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-        extract8_3bits_words(a0, a1, s2, w0, w1, w2, w3, w4, w5, w6, w7);
-        w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-        w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-        #pragma unroll
-        for (int r = 0; r < M; ++r)
-        {
-            const uint32_t* as = sh_as + r * slice_stride + (kb << 4);
-            uint2 as01 = *(const uint2*) (as + c2);
-            uint2 as89 = *(const uint2*) (as + c2 + 8);
-            ia0[r] = dp4a_us(w0, as01.x, ia0[r]);
-            ia0[r] = dp4a_us(w1, as01.y, ia0[r]);
-            ia0[r] = dp4a_us(w2, as89.x, ia0[r]);
-            ia0[r] = dp4a_us(w3, as89.y, ia0[r]);
-            ia1[r] = dp4a_us(w4, as01.x, ia1[r]);
-            ia1[r] = dp4a_us(w5, as01.y, ia1[r]);
-            ia1[r] = dp4a_us(w6, as89.x, ia1[r]);
-            ia1[r] = dp4a_us(w7, as89.y, ia1[r]);
-            if constexpr (residual)
-            {
-                const uint32_t* as2 = sh_as + (M + r) * slice_stride + (kb << 4);
-                uint2 bs01 = *(const uint2*) (as2 + c2);
-                uint2 bs89 = *(const uint2*) (as2 + c2 + 8);
-                ja0[r] = dp4a_us(w0, bs01.x, ja0[r]);
-                ja0[r] = dp4a_us(w1, bs01.y, ja0[r]);
-                ja0[r] = dp4a_us(w2, bs89.x, ja0[r]);
-                ja0[r] = dp4a_us(w3, bs89.y, ja0[r]);
-                ja1[r] = dp4a_us(w4, bs01.x, ja1[r]);
-                ja1[r] = dp4a_us(w5, bs01.y, ja1[r]);
-                ja1[r] = dp4a_us(w6, bs89.x, ja1[r]);
-                ja1[r] = dp4a_us(w7, bs89.y, ja1[r]);
-            }
-        }
-
-        extract8_3bits_words(b0w, b1w, s2, w0, w1, w2, w3, w4, w5, w6, w7);
-        w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-        w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-        #pragma unroll
-        for (int r = 0; r < M; ++r)
-        {
-            const uint32_t* as = sh_as + r * slice_stride + (kb << 4);
-            uint2 as01 = *(const uint2*) (as + c2);
-            uint2 as89 = *(const uint2*) (as + c2 + 8);
-            ib0[r] = dp4a_us(w0, as01.x, ib0[r]);
-            ib0[r] = dp4a_us(w1, as01.y, ib0[r]);
-            ib0[r] = dp4a_us(w2, as89.x, ib0[r]);
-            ib0[r] = dp4a_us(w3, as89.y, ib0[r]);
-            ib1[r] = dp4a_us(w4, as01.x, ib1[r]);
-            ib1[r] = dp4a_us(w5, as01.y, ib1[r]);
-            ib1[r] = dp4a_us(w6, as89.x, ib1[r]);
-            ib1[r] = dp4a_us(w7, as89.y, ib1[r]);
-            if constexpr (residual)
-            {
-                const uint32_t* as2 = sh_as + (M + r) * slice_stride + (kb << 4);
-                uint2 bs01 = *(const uint2*) (as2 + c2);
-                uint2 bs89 = *(const uint2*) (as2 + c2 + 8);
-                jb0[r] = dp4a_us(w0, bs01.x, jb0[r]);
-                jb0[r] = dp4a_us(w1, bs01.y, jb0[r]);
-                jb0[r] = dp4a_us(w2, bs89.x, jb0[r]);
-                jb0[r] = dp4a_us(w3, bs89.y, jb0[r]);
-                jb1[r] = dp4a_us(w4, bs01.x, jb1[r]);
-                jb1[r] = dp4a_us(w5, bs01.y, jb1[r]);
-                jb1[r] = dp4a_us(w6, bs89.x, jb1[r]);
-                jb1[r] = dp4a_us(w7, bs89.y, jb1[r]);
-            }
-        }
-
-        lo0 = lo1; hi0 = hi1;
-        lo1 = lo2; hi1 = hi2;
-    }
-    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
-}
+// K=3 register-pipelined unit (A15) REJECTED: 31.96 tok/s (-3.0% vs 32.95) with token parity
+// on gfx1100 Qwen3.8-27B-3.5bpw 4096/256. Coalesced VGPR loads + shuffle extract were correct
+// but slower than narrow's scattered ext8w — do not reintroduce without a cold-bench win.
 
 // Smem-staged generic unit: the warp stages its block pair's rows into a warp-private shared memory
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
@@ -1244,8 +1077,6 @@ void exl3_gemv_int8_sq_kernel
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
             gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
-        else if constexpr (bits == 3)
-            gemv_int8_unit_k3<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
         else if (use_smem)
             gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
         else
@@ -1379,8 +1210,6 @@ void exl3_gemv_int8_msq_kernel
             const uint16_t* B_j = B_list[j_r];
             if constexpr (bits == 4)
                 gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
-            else if constexpr (bits == 3)
-                gemv_int8_unit_k3<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
             else if constexpr (gemv_int8_stage_smem(bits))
                 gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, n_j);
             else
@@ -1439,8 +1268,6 @@ void exl3_gemv_int8_msq_kernel
         int* pacc = partials + (size_t) key * pstride;
         if constexpr (bits == 4)
             gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
-        else if constexpr (bits == 3)
-            gemv_int8_unit_k3<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
         else if constexpr (gemv_int8_stage_smem(bits))
             gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_stride_j, n_j);
         else
@@ -1639,8 +1466,6 @@ void exl3_gemv_int8_coop_kernel
             }
             if constexpr (bits == 4)
                 gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
-            else if constexpr (bits == 3)
-                gemv_int8_unit_k3<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
             else if constexpr (gemv_int8_stage_smem(bits))
                 gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n, size_n);
             else
