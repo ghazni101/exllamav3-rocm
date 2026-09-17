@@ -1149,3 +1149,9 @@ an alternative, and the prize is 3.7x on the shape that is 68% of prefill device
 work is a direct hipBLASLt integration - descriptors with `HIPBLASLT_ORDER_ROW` layouts, a
 `HIPBLAS_OP_T` on the (n, k) operand, `hipblasLtMatmulAlgoGetHeuristic` with the 16 MB workspace
 `DevCtx` already exposes, and the KLD gate on the fp32-output layers - not an ATen detour.
+
+That integration is already unblocked at the toolchain level, checked on the shipping image:
+`hipblaslt/hipblaslt.h` ships in `_rocm_sdk_devel/include`, and **the built extension already links
+`libhipblaslt.so.1`** (`ldd exllamav3_ext*.so` resolves it through the ROCm SDK libraries), so this
+is an include-path plus a direct API call rather than a new dependency - only the HIPBLASLt header
+directory needs adding to `setup.py`'s include dirs.
