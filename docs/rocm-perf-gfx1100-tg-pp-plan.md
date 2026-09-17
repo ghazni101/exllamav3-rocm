@@ -1155,3 +1155,72 @@ That integration is already unblocked at the toolchain level, checked on the shi
 `libhipblaslt.so.1`** (`ldd exllamav3_ext*.so` resolves it through the ROCm SDK libraries), so this
 is an include-path plus a direct API call rather than a new dependency - only the HIPBLASLt header
 directory needs adding to `setup.py`'s include dirs.
+
+### 11.8 Session 6: D2 resolved - the 68% is the fp32-output GEMM, and the fix needs no new library
+
+**The dominant kernel D1 named is an fp32-*output* GEMM.** Tensile's naming says it: the 68.2%
+entry is `Cijk_Ailk_Bljk_**HSS**_BH_MT64x32x8_...` (A half, B half, C/D single) at 12.8 ms and
+28.5 TFLOP/s, while the 11.2% entry is `..._HHS_...` (fp16 C/D) at 3.3 ms. Those 223 HSS launches
+are the input projections - q/k/v and gate/up - which every architecture file builds with
+`out_dtype = torch.float` (`exllamav3/architecture/*.py`, a project-wide convention; the fp16
+output projections are the 142-launch `HHS` entry, ~2 per layer).
+
+**Direct measurement of the extension's own entry point** (`profiling/f32out_gemm_probe.py`, new;
+m=2048, rotated weight pools, so the comparison is not Infinity-Cache-resident):
+
+| shape (k x n) | c fp16 | c fp32 | ratio |
+|---|---|---|---|
+| 5120 x 17408 (the dominant shape) | 102.6 TFLOP/s / 3.56 ms | 18.3 / 19.99 ms | 5.6x |
+| 17408 x 5120 | 91.6 / 3.99 ms | 18.0 / 20.25 ms | 5.1x |
+| 5120 x 6144 | 95.7 / 1.35 ms | 18.3 / 7.04 ms | 5.2x |
+| 6144 x 5120 | 90.5 / 1.42 ms | 18.2 / 7.08 ms | 5.0x |
+
+So the fp16-output GEMM on this stack is *already* at 90-103 TFLOP/s, and the earlier "hipBLASLt is
+3.7x faster than the extension" reading was confounded by the output dtype: the comparison pitted
+hipBLASLt-fp16-out against an in-model mix dominated by fp32-out calls.
+
+**hipBLASLt does not fix it** (`profiling/hgemm_lt_probe.hip`, standalone hipcc probe, same layouts
+as the incumbent call): fp16 D 92.3 TFLOP/s, **fp32 D 19.0 TFLOP/s** - i.e. the slow HSS kernel is
+slow in both libraries, so there is no backend win in either dtype. The `EXL3_HGEMM_LT` path built
+earlier in this session was therefore reverted as measured dead weight (it also hard-faulted the GPU
+until the layouts were mirrored exactly: the incumbent is
+`cublasGemmEx(OP_N, OP_N, size_n, size_m, size_k, A=b lda=size_n, B=a ldb=size_k, C=c ldc=c_stride_m)`,
+i.e. `ext.hgemm(a, b, c)` is the ordinary `a @ b`; declaring row-order layouts reads `b` at stride
+`k` instead of `n` and faults).
+
+**The fix that ships: `EXL3_HGEMM_F16OUT` (default on).** The fp32-output GEMM runs into a grow-only
+fp16 slab and is widened into `c`; accumulation stays fp32 and the only numeric change is one
+rounding of the result to fp16 - the precision the residual stream already carries on the output
+projections. Measured in-extension, per shape: 20.07 -> 3.77 ms (96.9 TFLOP/s at 5120 x 17408),
+20.4 -> 4.08, 7.03 -> 1.40, 7.11 -> 1.49 ms - **4.8-5.0x**, and the widening costs ~4% of the GEMM.
+
+End-to-end, `bench_lean` on one image, two runs per arm (`EXL3_HGEMM_F16OUT=0|1`):
+
+| metric | arm 0 (fp32 out) | arm 1 (fp16 slab) |
+|---|---|---|
+| prefill 2k (tok/s) | 324.7 / 345.3 | **562.0 / 511.1** |
+| decode b1 (tok/s) | 30.51 / 30.57 | 30.56 / 30.56 |
+| batch 2/4/6/8 aggregate | 34.35/33.17/23.19/32.60 | 34.29/33.02/23.14/32.53 |
+
+**Numerics (same image; the arm-vs-arm comparison is the only token comparison the findings log
+considers meaningful, section 11.4).** Worst model-level KLD **1.926e-03** ('numeric'), 5.355e-04
+(longctx_4k, the prompt on the reconstruct path), 4.756e-04 / 4.927e-04, 0.000e+00 elsewhere;
+**zero greedy divergence in 8 steps on all 8 prompts**; arm-vs-arm determinism bit-exact
+(0.000e+00, PASS). That sits inside the 1.1-4.1e-3 band already accepted for the msq/T1 prefill
+route (findings-log 10.3, same zero-divergence signature). The gate script's own 1e-3 default is a
+same-binary *determinism* threshold; the plan's bar for an intentional prefill-GEMM numeric change
+is 4e-3, and both were reported rather than argued away.
+
+**Gates on the shipping image.** Golden tokens: 2/8 diverged - `short_general` at generated-token 20
+and `unicode` at 185. Session 5's perf-c rebuild diverged on *the same two prompts*, `short_general`
+at the *same* token 20, with no f16out code in it, so this is the documented per-rebuild artifact,
+not this change. Batch gate: `batch_e` only, the pre-existing artifact. Soak: 59 rounds / 16928
+generated tokens, no hang (PASS).
+
+**One bug worth remembering:** the slab is grow-only, so `slab.view({m, n})` throws as soon as a
+smaller shape follows a larger one (caught immediately by the per-shape probe, not by the model
+run) - narrow to `m*n` before reshaping.
+
+**Deployment.** `profiling/promote_f16out.sh` follows `promote_tg1a.sh`: rollback tag of the current
+base, retag the perf image as `exllamav3-rocm:serve`, rebuild the TabbyAPI overlay from it, recreate
+the serve, poll health.

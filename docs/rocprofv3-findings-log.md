@@ -734,3 +734,28 @@ settles the three-way disagreement in the plan's fact 6: the 28.7 TFLOP/s in-mod
 in-model truth, and the 83.5-100 TFLOP/s figures come from a *different library* - torch's backend
 here is hipBLASLt, while the ext calls hipBLAS `cublasGemmEx` with `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
 The prefill headroom is therefore configuration selection, ~2/3 of prefill.
+
+---
+
+## 13. Finding: the prefill "GEMM configuration" gap is the fp32-output path (session 6)
+
+D1's 68.2% entry (`Cijk_Ailk_Bljk_HSS_...`, 12.8 ms/launch, 28.5 TFLOP/s) is an fp32 C/D GEMM: the
+input projections (q/k/v, gate/up) are built with `out_dtype = torch.float`, the output projections
+with `torch.half`. Measured through the extension's own entry point (m=2048, rotated buffers):
+fp16 output 90.5-102.6 TFLOP/s, fp32 output 18.0-18.3 TFLOP/s - 5.0-5.6x, in the *same* call.
+
+Corollary that corrects the earlier session's reading: hipBLASLt is not faster here. A standalone
+hipcc probe with the incumbent's exact layouts gives 92.3 (fp16 D) and **19.0 (fp32 D)** TFLOP/s, so
+the slow HSS kernel is slow in both libraries and the 3.7x of D2 was an output-dtype confound. The
+`EXL3_HGEMM_LT` path was reverted.
+
+Also recorded, because it cost a GPU fault: the incumbent call is
+`cublasGemmEx(OP_N, OP_N, size_n, size_m, size_k, A=b lda=size_n, B=a ldb=size_k, C=c ldc=c_stride_m)`
+- `ext.hgemm(a, b, c)` is the ordinary `a @ b`. Declaring the same operands with
+`HIPBLASLT_ORDER_ROW` layouts makes the kernel read `b` at stride `k` instead of `n` and faults with
+"Memory access fault by GPU node-1 ... Page not present".
+
+Fix shipped: `EXL3_HGEMM_F16OUT` (default on) runs the fp32-output GEMM into an fp16 slab and widens
+it. In-extension 4.8-5.0x per shape; end-to-end prefill 2k 324.7/345.3 -> 562.0/511.1 tok/s with
+decode and every batch aggregate unchanged; worst model-level KLD 1.9e-3, zero greedy divergence in
+8 steps, determinism bit-exact. Full numbers and gates: plan doc section 11.8.
