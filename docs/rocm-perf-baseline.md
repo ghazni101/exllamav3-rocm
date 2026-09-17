@@ -354,6 +354,109 @@ known NaN at M>=3 to bisect) as a hipBLAS alternative.
 4. Serving soak (batch determinism, mixed-length concurrency, mid-generation disconnect):
    pending on the final build.
 
+## Iteration 3 (2026-09-17): deploy currency, host gap, batch-decode dispatch, msq-single routing
+
+### Deployment: live-tree serving (compose change)
+
+The standing container had been serving the `gfx1101-msq7` image — 46 package files and the
+baked `exllamav3_ext.so` behind `rocm-port@18ec5e3`, i.e. the entire iteration-2 prefill win
+(hipBLASLt GEMM backends, async GDN stash, warmup) was committed but **not deployed**. The
+compose now uses the deps-only `local/exl3-rocm:gfx1101-base` image with the worktree
+bind-mounted rw at `/opt/exllamav3` (the iteration-2 dev shape): the extension JIT-builds into
+the `exl3_exl3-cache` volume from the live tree, so neither python nor C++ edits can go stale
+silently, and a deploy is `docker compose up -d`. Measured on the endpoint (fresh ~2k-token
+prompts, `/generate` `time_prefill_s`, warm server): **262 → ~510 t/s prefill (1.95×)**;
+decode/4-way unchanged as expected. Golden gate after redeploy: 7/8 bit-identical + the
+documented prompt-6 two-token near-tie at generated token 86 = the accepted iteration-2 state.
+
+### Host gap: closed (0.2%)
+
+CUDA-events bracketing of `gen.iterate()` per token (`.profiling`, `hostgap_rocm.py`):
+wall 1.283 s vs stream-time 1.280 s over 24 steady tokens — **the host gap is 0.2%**.
+Decode is device-bound end to end; P2 host work (sampler readback overlap etc.) has nothing
+left to win. Steady decode is 37.0–37.4 ms/token wall (26.8–27.0 t/s), matching the bench.
+
+### Where the remaining decode/batch time actually goes (corrected profiles)
+
+Earlier profiles amortized the **job-start prefill** (each `gen_n`/HTTP request runs its prompt
+once; a 12-token prompt is an m=11 forward through every single-matrix linear) into per-token
+numbers — that is where the "32 coop-gemm calls/token" reads came from, not decode. With
+steady-state-only windows (`batchprofile_rocm.py`, events-gated steps):
+
+- **Decode b1 (m=1)**: zero int8 gate misses (EXL3_DBG_GEMV census, re-run with the env
+  actually propagated — the earlier census script silently missed it). ~360 sq/msq calls/token,
+  healthy. Nothing dispatch-level left; kernel efficiency (sq/msq at 50–100 GB/s vs 432 peak)
+  remains the sole decode lever and is unchanged.
+- **Batch-8 decode (m=8)**: single-matrix mul1 linears DO fall to the grid-starved cooperative
+  `exl3_gemm_kernel`, but the bulk of it (40%+16% of exl3 device time, ~115 calls/step) is
+  **K = 1 tensors with `size_n % 256 != 0`** (n = 1152-class small projections), which the
+  int8 entry gate declines before any routing (`size_n % 256` check). The QTIP fp16 GEMV
+  cannot take K = 1 either (no K=1 instantiation), so these shapes are coop-gemm-or-nothing
+  today. Closing this = column-tiling surgery on the sq/msq kernels (256 → 128-granular
+  columns + counter layout) — the documented next-iteration item, still open.
+- Batch aggregate anomaly (batch-8 < batch-1) reproduces on the unmodified build
+  (quickbench: b1 21.9, b4 27.7, b8 21.0, b16 29.5 t/s incl-prefill aggregate).
+
+### msq-single routing (implemented, verified, perf-gated OFF)
+
+`exl3_gemv_int8.cu`: single-matrix mul1 calls with m in 5..144 can route through the msq
+kernel as a one-entry bundle (`exl3_gemv_int8_msq_single`, eager-only; pointer arrays cached
+per matrix; env `EXL3_INT8_MSQ_SINGLE=1` to enable, `EXL3_INT8_MSQ_SINGLE_MAX_M` caps m,
+default 144). **Default OFF** per the perf gate: measured parity with the cooperative kernel
+on the routed slice (K=1 msq ~820 µs vs coop ~1000 µs per call at m=8 — within run noise e2e)
+and batch-16 regressed ~9% at the wide cap. Correctness is proven for whenever the n%256 work
+makes the wider slice attractive: `test_msq_single_diag.py` sweeps m ∈ {8, 11, 32, 144} ×
+K ∈ {1, 2, 3} against the forced-cooperative reference at ≤ 0.9% rel_rms (gate 0.02), all OK.
+(Note: `EXL3_DBG_GEMV`-style env vars must be added to `.profiling/runc.sh`'s propagation
+list or the container silently runs without them — burned twice this session.)
+
+### Crash fix (unconditional keep): msq workspace-fit infinite loop
+
+The msq launcher's workspace-growth loop terminates on `rows_per >= rows_max` only. For
+matrices where `rows_total <= rows_max` (narrow k) and a wide n (lm_head, n = 248320,
+pstride ≈ 249 KB/row-slice), even `ksplit = 1` overflows the 16 MB workspace while `rows_per`
+can no longer change → **host-side infinite loop, GPU wedged behind it**. Reachable through
+the routing above (autosplit load measurement hangs in `model.load()`, diagnosed via
+py-spy --native: spin inside `gemv_int8_get_ws`) and through bundled calls at high m (e.g.
+batch-16 gate+up) — i.e. a latent pre-existing bug. Fixed with an exact floor guard:
+`if (rows_per >= rows_max || ksplit <= 1) return false;` (fall through to the cooperative
+kernel as before). With the fix, full-load + quickbench complete cleanly under routing.
+
+### Final-build gates
+
+1. Golden `--check` vs `.profiling/golden_baseline2.json` (clean rebuild, routing default
+   OFF): 7/8 identical + documented prompt-6 near-tie = accepted state, numerics unchanged.
+2. pytest quant suite (test_qgemm, test_quant_fn, test_cache_rotate, test_gated_delta_rule):
+   **not runnable on this host** — the upstream tests hardcode `/mnt/str/...` llama3.1-8b
+   model paths that don't exist here (pre-existing; not caused by this iteration). Kernel-level
+   coverage instead: `test_msq_ab.py` (bundle msq A/B, this model) — **PASS**, bit-exact vs
+   per-matrix int8 at m=1/m=4, deterministic across repeats, ≤ 0.8% vs coop; plus
+   `test_msq_single_diag.py` all-OK as above.
+3. Serving soak on the redeployed final build: batch determinism 4/4 concurrent-identical
+   greedy == solo; 8-way mixed-length (12–800 tok prompts) 8/8 ok; two mid-generation
+   disconnects then immediate clean regeneration; HTTP golden baseline captured to
+   `.profiling/http_golden_baseline.json` (serve-encode-path greedy text, 8 prompts) for
+   future endpoint gates.
+
+### Iteration-3 results (endpoint, port 8420, warm, greedy)
+
+| metric | stale container (msq7) | iteration-3 final | note |
+|---|---|---|---|
+| decode b1 stream t/s | 26.4–26.6 | 26.2–26.4 | unchanged (expected) |
+| decode b1 e2e t/s | 25.1–25.4 | 25.2–25.4 | serving overhead already ~5% |
+| 4-way concurrent aggregate | 25.4 | **28.9** | +12–14% |
+| prefill ~2k fresh t/s | 262 | 419–510 | 1.6–2.0× (deployed iter-2 backends) |
+| VRAM at 32k cache | 10.03 GB | 10.03 GB | unchanged |
+
+The decode number is honest about the ceiling of this iteration: the m=1 int8 path was
+already fully engaged, the host gap is 0.2%, and the remaining coop-gemm bulk at batch > 4
+is the n % 256 K=1 slice that needs kernel column work. Next levers, in order:
+1. sq/msq column tiling at 128 granularity (unlocks the n=1152-class projections = the
+   batch-decode coop bulk), with the msq-single routing then perf-gated per-shape on top.
+2. sq/msq kernel memory-pipeline efficiency (50–100 → 200+ GB/s) — the only decode lever.
+3. Prefill sub-144 chunk shapes after (1) lands (today routed shapes showed parity, so the
+   routing stays default-off).
+
 ## Static decode-path analysis (rocm-port)
 
 Per token, batch 1, ~64 layers → roughly 350–450 kernel launches. CUDA-graph

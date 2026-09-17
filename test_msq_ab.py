@@ -8,7 +8,7 @@
 #
 # Usage (container): python3 /src/test_msq_ab.py
 import os, sys
-sys.path.insert(0, "/src")
+sys.path.insert(0, "/opt/exllamav3")
 import torch
 from exllamav3 import Config, Model
 from exllamav3.modules.multilinear import SlicedMultiLinear, MultiLinear

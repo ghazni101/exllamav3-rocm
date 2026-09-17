@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <map>
+#include <mutex>
+#include <ATen/ATen.h>
 
 
 // Mode 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit effective activation
@@ -419,7 +421,10 @@ bool exl3_gemv_int8_msq
                        + (size_t) num_jj * ksplit * pstride;
         ws_ptr = gemv_int8_get_ws(device, ws_ints);
         if (ws_ptr) break;
-        if (rows_per >= rows_max)
+        // ksplit == 1 is the workspace floor (growing rows_per past rows_total can't shrink
+        // the allocation further); without this guard a wide-n matrix (lm_head) with a narrow
+        // k spins here forever
+        if (rows_per >= rows_max || ksplit <= 1)
         {
             if (dbg_gemv_enabled())
                 fprintf(stderr, "[exl3_msq] ws: jj=%d ksplit=%d rows_per=%d\n", num_jj, ksplit, rows_per);
@@ -475,6 +480,97 @@ bool exl3_gemv_int8_msq
     return true;
 }
 
+// Single-matrix m > sq-cap routing through the msq kernel (a one-entry bundle). The alternative
+// for these calls is the grid-starved cooperative gemm kernel — batch > 4 decode steps and the
+// sub-threshold prefill shapes — so the workspace/counters fit checks in the launcher are the
+// only gate that matters. The launcher dereferences the pointer arrays on device; B/suh/svh are
+// invariant for a loaded module, so the three-entry array is built once per matrix and cached.
+// Eager only: graphed callers (bsz == 1 decode, m == 1) never reach this branch.
+static bool exl3_gemv_int8_msq_single
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool c_fp32,
+    int device,
+    int num_sms,
+    cudaStream_t stream
+)
+{
+    static const bool disabled = []
+    {
+        // Default off: routed shapes measured at parity with the cooperative kernel (K = 1
+        // msq ~820 us vs coop ~1000 us per call at m = 8) and m >= 13 batches regressed at a
+        // wide cap, so the perf gate keeps it opt-in until the n % 256 single-matrix gate gap
+        // (the actual batch-decode coop bulk) is closed. Verified correct for m up to 144:
+        // test_msq_single_diag.py, all K, <= 0.9% rel_rms vs the cooperative reference.
+        const char* e = getenv("EXL3_INT8_MSQ_SINGLE");
+        return !(e && atoi(e));
+    }();
+    static const int max_m = []
+    {
+        const char* e = getenv("EXL3_INT8_MSQ_SINGLE_MAX_M");
+        return e ? atoi(e) : 144;
+    }();
+    if (disabled || size_m > max_m) return false;
+
+    // The kernel writes one hadamard-transformed input slab of m * k halves
+    if ((int64_t) A_had.numel() < (int64_t) size_m * size_k) return false;
+
+    static std::mutex mtx;
+    static std::map<uintptr_t, at::Tensor> args_cache[MAX_DEVICES];
+
+    at::Tensor args;
+    uintptr_t B_ptr = (uintptr_t) B.data_ptr();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto& cache = args_cache[device];
+        auto it = cache.find(B_ptr);
+        if (it == cache.end())
+        {
+            int64_t host[3] =
+            {
+                (int64_t) B_ptr,
+                (int64_t) (uintptr_t) suh.data_ptr(),
+                (int64_t) (uintptr_t) svh.data_ptr()
+            };
+            args = at::empty({3}, B.options().dtype(at::kLong));
+            args.copy_(at::from_blob(host, {3}, at::kLong), /*non_blocking*/ false);
+            it = cache.emplace(B_ptr, args).first;
+        }
+        args = it->second;
+    }
+
+    uintptr_t* base = (uintptr_t*) args.data_ptr();
+    return exl3_gemv_int8_msq(
+        (const half*) A.data_ptr(),
+        (const uintptr_t*) (base + 0),
+        C.data_ptr(),
+        size_m, size_k, size_n,
+        (const uintptr_t*) (base + 1),
+        (half*) A_had.data_ptr(),
+        (const uintptr_t*) (base + 2),
+        nullptr,               // indices
+        nullptr,               // weights
+        1,                     // bszm_in
+        1,                     // bszm_out
+        -1, -1,                // min/max index
+        1,                     // num_tokens
+        nullptr,               // size_n_list
+        nullptr,               // c_list
+        nullptr,               // n_stride_list
+        nullptr,               // had_src_list
+        0,                     // num_had_src
+        K, c_fp32, device, num_sms, stream, nullptr);
+}
+
 bool exl3_gemv_int8
 (
     const at::Tensor& A,
@@ -517,14 +613,23 @@ bool exl3_gemv_int8
 
     // Per-slice-scale kernel: m <= 4 in plain int8 mode (rows share the decoded weights and the B
     // stream). Falls through to the cooperative kernel on a constraint miss; batched rows beyond
-    // the gate go straight to the regular kernel.
+    // the gate try the msq kernel as a one-entry bundle (the cooperative gemm alternative is
+    // grid-starved on RDNA at every m), then decline.
     if (size_m <= (residual ? 1 : 4) && exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
         size_m, size_k, size_n, K, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
         device, num_sms, stream, graph))
         return true;
-    if (size_m > 1) { dbg("m>1 after sq"); return false; }
+    if (size_m > 1)
+    {
+        if (!graph && exl3_gemv_int8_msq_single(
+            A, B, C, suh.value(), A_had.value(), svh.value(),
+            size_m, size_k, size_n, K, c_fp32, device, num_sms, stream))
+            return true;
+        dbg("m>1 after sq");
+        return false;
+    }
 
     void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
     if (!fn) { dbg("no coop int8 kernel"); return false; }
