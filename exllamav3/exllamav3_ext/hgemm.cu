@@ -2,6 +2,7 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/Functions.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -27,12 +28,17 @@ using bfloat16 = __nv_bfloat16;
 // EXL3_HGEMM_F16OUT runs the GEMM into an fp16 slab and widens it (the accumulation stays fp32;
 // the only numeric change is one rounding of the result to fp16, the same precision the residual
 // stream already carries). Off by default: it ships only with the logits KLD gate.
+// Default ON: measured +60-73% prefill 2k (bench_lean, two runs per arm on one image: 324.7/345.3
+// -> 562.0/511.1 tok/s) with decode and every batch aggregate unchanged, at a model-level KLD of
+// 1.9e-3 worst (5.4e-4 on the long-context prompt) and zero greedy divergence in 8 steps - inside
+// the 1.1-4.1e-3 band already accepted for the msq/T1 prefill route (findings-log 10.3).
+// EXL3_HGEMM_F16OUT=0 restores the fp32-output path exactly.
 static bool hgemm_f16out_enabled()
 {
     static const bool on = []
     {
         const char* e = getenv("EXL3_HGEMM_F16OUT");
-        return e && atoi(e) != 0;
+        return e ? atoi(e) != 0 : true;
     }();
     return on;
 }
@@ -100,7 +106,9 @@ static void hgemm_gemmex_impl
     float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
 
-    if (output_fp32 && hgemm_f16out_enabled())
+    // c.dim() == 2 only: all in-tree callers pass the (m, n) slab that reconstruct_hgemm builds;
+    // a higher-rank c keeps the incumbent path rather than risking a shape mismatch.
+    if (output_fp32 && c.dim() == 2 && hgemm_f16out_enabled())
     {
         // Same call, fp16 destination, then widen into c (which may be a strided slice view)
         at::Tensor scratch = hgemm_f16_scratch(c, size_m, size_n);
@@ -117,7 +125,11 @@ static void hgemm_gemmex_impl
         );
         cublas_check(r16);
         cuda_check(cudaPeekAtLastError());
-        c.copy_(scratch.view({size_m, size_n}));
+        // The slab is grow-only, so it is usually larger than this call needs: narrow it to the
+        // exact element count before reshaping (a plain .view() would reject a reused larger slab
+        // as soon as a smaller shape follows a larger one - caught by the per-shape probe).
+        int64_t numel = (int64_t) size_m * (int64_t) size_n;
+        c.copy_(scratch.narrow(0, 0, numel).view({size_m, size_n}));
         return;
     }
 
