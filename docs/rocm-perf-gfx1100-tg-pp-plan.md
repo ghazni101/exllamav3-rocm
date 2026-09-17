@@ -1242,3 +1242,43 @@ and it is the only metric stable to <1% across runs. The 1.5k and concurrent num
 post-promote run are inflated because that run follows the serve's warmup directly; the repeat run
 measures them better than the pre-promote baseline. Both runs are reported because the first one is
 the one that looked like a regression, and it is not one.
+
+### 11.9 D4 (chunk host gap) resolved: it is graph capture, not a per-chunk walk
+
+With the GEMM fixed, the same 2048-token cold prefill returns `prefill_ms` 2213 in one profile run
+and 4028 in another while device time moves only 1853 -> 1976 ms - a 1.8x run-to-run spread in the
+*wall*, which is what needed explaining. The CPU-ranked attribution (added to
+`profiling/prefill_profile.py`, since the op table dropped CPU-only entries and python-side ops sum
+to ~30 ms) names it: hipMemcpyWithStream 1374 ms / 102 calls, hipDeviceSynchronize 418 / 68,
+hipStreamCreateWithFlags 245 / 64 + hipStreamDestroy 89 / 64, hipGraphInstantiate 5.5 / 64. Those
+counts are one per *layer*: per-layer CUDA-graph capture, not the per-chunk (reconstruct, GEMM)
+Python walk D4 anticipated (hipLaunchKernel is 14.7 ms over 2536 launches). `with_stack=True`
+records no python stacks for these libusdt entries on this torch build, so the count + overlap
+evidence is what the conclusion rests on rather than a named frame.
+
+Consequences, all measured rather than argued:
+- The capture cost is a constant in *both* `bench_lean` arms (fresh process, nonced prompt, fresh
+  cache/page layout each run), which is why that metric shows 1.49-1.58x while the live serve shows
+  2.31x: the serve captures once per shape during warmup and reuses, and its cold-3k TTFT is stable
+  at 1.47-1.48 s across runs - below the 2.1 s capture cost, so the serving path is not paying it.
+- D4's premise is therefore not justified, and the plan's 600 tok/s *bench_lean* target is not
+  reachable by product work: that metric carries a harness-side constant. D3 (overlap the reconstruct
+  with the GEMM on a side stream) is likewise not indicated - `reconstruct_had_kernel` is 7.1% of
+  device time against a GEMM that is now 50.7%.
+
+**Post-fix device composition** (2048-token cold prefill, 1975.6 ms total, down from 4182 ms; the
+fp32-output calls now land on the same fast `HHS_MT128x128x16` config as the fp16-output ones):
+
+| item | ms | share |
+|---|---|---|
+| fp16-output GEMM (hipBLAS Tensile HHS) | 1002.3 | 50.7% |
+| chunk GEMM/GEMV routes (exl3_gemm/gemv/msq) | 372.8 | 18.9% |
+| reconstruct (trellis -> fp16 slab) | 139.6 | 7.1% |
+| attention / GDN / conv1d | 138.0 | 7.0% |
+| norms / act / elementwise | 115.3 | 5.8% |
+| `aten::copy_` (includes the widening, 87.1 ms) | 87.1 | 4.4% |
+| everything else (launch, cache, other) | 63.8 | 3.2% |
+
+No remaining prefill item is above 12% outside the GEMM, and the GEMM itself is running at 90-103
+TFLOP/s of the ~100 this part reaches on these shapes - so prefill is done unless someone attacks
+the 18.9% chunk-route GEMV/GEMM family, which is the same family B2/msq already covered.

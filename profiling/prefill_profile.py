@@ -115,9 +115,27 @@ print(f"\n== device time by entry (total {total:.1f} ms) ==")
 for ms, cnt, key in krows[:22]:
     print(f"  {ms:9.3f} ms {100*ms/total:5.1f}%  n={cnt:6d}  {key[:96]}")
 
+# (c) host attribution: the same events ranked by self CPU time. The prefill wall exceeds the
+# device total by ~2.2 s on this model, and only a CPU-ranked table says where it goes (the op
+# table above drops CPU-only ops such as aten::empty/view and the python-side dispatch around
+# reconstruct_hgemm).
+cpu_rows = []
+for ev in prof.key_averages():
+    cpu_us = getattr(ev, "self_cpu_time_total", 0) or 0
+    if cpu_us <= 0 or ev.count == 0:
+        continue
+    cpu_rows.append((cpu_us / 1e3, ev.count, ev.key))
+cpu_rows.sort(reverse=True)
+total_cpu = sum(r[0] for r in cpu_rows)
+print(f"\n== host time by entry (total self CPU {total_cpu:.1f} ms) ==")
+for ms, cnt, key in cpu_rows[:20]:
+    print(f"  {ms:9.3f} ms  n={cnt:6d}  {key[:96]}")
+
 with open(os.path.join(OUT_DIR, "d1_prefill_profile.json"), "w") as f:
     json.dump(dict(prompt_tokens=int(prompt2.shape[1]), wall_s=round(wall, 3),
                    prefill_ms=prefill_ms, total_cuda_ms=round(total, 3),
-                   ops=rows, kernels=[dict(ms=round(a, 3), count=b, key=c) for a, b, c in krows[:40]]),
+                   ops=rows, kernels=[dict(ms=round(a, 3), count=b, key=c) for a, b, c in krows[:40]],
+                   total_cpu_ms=round(total_cpu, 3),
+                   cpu=[dict(ms=round(a, 3), count=b, key=c) for a, b, c in cpu_rows[:40]]),
               f, indent=1)
 print("wrote d1_prefill_profile.json", flush=True)
