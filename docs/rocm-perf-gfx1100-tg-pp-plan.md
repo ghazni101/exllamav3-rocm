@@ -1221,6 +1221,24 @@ generated tokens, no hang (PASS).
 smaller shape follows a larger one (caught immediately by the per-shape probe, not by the model
 run) - narrow to `m*n` before reshaping.
 
-**Deployment.** `profiling/promote_f16out.sh` follows `promote_tg1a.sh`: rollback tag of the current
-base, retag the perf image as `exllamav3-rocm:serve`, rebuild the TabbyAPI overlay from it, recreate
-the serve, poll health.
+**Deployment (done, live).** `profiling/promote_f16out.sh` follows `promote_tg1a.sh`: rollback tag
+`exllamav3-rocm:serve-pre-f16out`, retag `exllamav3-rocm:perf-i` as `exllamav3-rocm:serve`, rebuild
+the TabbyAPI overlay from it, recreate the compose service, poll health. The shipped image was
+verified *before* promotion: bench prefill 2k 512.3 / 512.8 tok/s (two runs), the arm-1 KLD profile
+reproduced exactly (1.926e-03 worst, zero divergence), and the same two pre-existing golden
+divergences.
+
+**Live, through the HTTP endpoint (`profiling/ttft_probe.py`, same day, pre-post):**
+
+| probe | pre-promote (10:33) | post-promote (10:59 / 11:01) |
+|---|---|---|
+| cold 3.2k TTFT | 3.474 / 3.424 / 3.424 s | **1.479 / 1.476 / 1.474 s** and 1.482 / 1.480 / 1.476 s |
+| warm-prefix (cache hit) | 0.584 s | 0.366 s |
+| 1.5k prefill | 2.204 s | 2.488 s then **1.286 s** |
+| concurrent 2x decode, TTFT / wall | 2.115 s / 12.508 s | 4.158 s / 13.826 s then **0.601 s / 10.276 s** |
+
+Cold-prefill TTFT is **2.31x shorter** (3.42-3.47 s -> 1.47-1.48 s, beyond the plan's <=2.0 s target)
+and it is the only metric stable to <1% across runs. The 1.5k and concurrent numbers in the first
+post-promote run are inflated because that run follows the serve's warmup directly; the repeat run
+measures them better than the pre-promote baseline. Both runs are reported because the first one is
+the one that looked like a regression, and it is not one.
