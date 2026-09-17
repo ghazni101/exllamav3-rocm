@@ -577,3 +577,91 @@ Follow-ups, in order:
 - Images: `exllamav3-rocm:perf-tg1a` / `perf-tg1b` exist as artifacts (do not promote);
   `Dockerfile.perf` is pinned to the correct base for the next attempt.
 - Decode (tg) next lever remains tg-1b done right (§10.4 list), then tg-2 GEMV efficiency.
+
+---
+
+## 11. Session 4: tg-1b re-attempt — two latent bugs, an honest A/B, three refuted premises
+
+Date: 2026-09-16 night → 17. Branch `rocm-perf`. Serve restored at session end (deployed
+image, chunk 2048, re-verified golden-exact).
+
+### 11.1 The original tg-1b "deadlock" was two stacked bugs
+
+1. The patch (49e89f7) passed HOST stack arrays as the msq kernel's B/suh/svh pointer lists.
+   The kernel dereferences the lists with device instructions (the mgemm path passes address
+   tensors, `MultiLinear.ptrs_*`) — the first staged unit faults the queue. Fixed in the
+   re-attempt with a device-side list buffer written by a 1-thread kernel whose launch
+   arguments carry the pointers (capture-safe, no host/DMA race when calls run ahead on the
+   stream — a pinned-staging variant was tried first and has exactly that race).
+2. The msq workspace-growth loop terminated on `rows_per >= rows_max`, but `rows_per`
+   saturates at `(rows_total + 7) & ~7` — below `rows_max` whenever `rows_total < rows_max`.
+   lm_head-shaped calls (n = 248320) at m in (4, 144] then spin the host forever. Fixed:
+   terminate when the growth step stops increasing `rows_per`. (Fixed on the branch; the
+   deployed config cannot reach it — the single-matrix route was reverted — but the loop is
+   live code in the msq launcher.)
+
+### 11.2 Perf-image builds silently shipped the base .so
+
+`COPY . /opt/exllamav3` carried the repo's stale `build/` tree → setuptools skipped the
+rebuild → pip failed → `RUN pip install ... | tail -20` swallowed the exit → the image kept
+the base's .so (timestamp Sep 16 11:48) while appearing rebuilt. Found by running `strings` on
+the installed .so and grepping for a source marker: zero hits. Consequence: every perf-image
+measurement earlier in the evening (including the first A/B rounds and the "coop reference")
+was the base extension. `Dockerfile.perf` now: removes `build/` in-image, keeps pip's log and
+fails on error, and verifies the installed .so contains a marker string from the patched
+source. `.dockerignore` added (build/, .git, artifacts).
+
+### 11.3 Cold-state kernel A/B (the numbers that decided tg-1b)
+
+`profiling/msq_ab2.py`: rotates 2–4 same-shape layer instances so each call streams cold
+weights (in-model re-reads happen after ~13 GB of other traffic; a same-tensor bench loop is
+Infinity-Cache-resident and mis-ranks kernels — earlier warm numbers were 1.5–2× inflated).
+Real trellis/scales from layers 3/7/11/15/19/23 (q_proj, k=5120, n=12288), K ∈ {3,4}.
+
+| m | K=3 msq / coop (ms) | K=4 msq / coop (ms) | verdict |
+|---|---|---|---|
+| 1 | 0.112 / 0.115 | 0.060 / 0.065 | sq path (unchanged) |
+| 5 | 0.570 / 0.575 | **0.279 / 0.477** | msq 1.7× at K=4; K=3 flat |
+| 8 | 0.322 / 0.309 | 0.465 / 0.473 | **parity** (~530–610 GB/s both) |
+| 16 | 0.694 / 0.472 | 0.932 / 0.500 | coop 1.5–1.9× faster |
+| 32 | 1.446 / 0.938 | 1.836 / 0.954 | coop ~2× faster |
+| 128 | 5.66 / 3.66 | 6.92 / 3.65 | coop ~1.9× faster |
+
+Numerics: msq bit-exact vs per-row sq chunks for K=4 at m ∈ {5, 8} (maxrel 0.00e+00) and ≤
+9.4e-3 elsewhere (workspace-growth changes the slice height at large m — expected).
+Deterministic everywhere. Model-level KLD vs incumbent on the 5 short prompts: 1.1–4.1e-3
+(with padded-vocab channels trimmed), zero greedy divergence in 8 steps — the per-slice-vs-
+global scheme delta, the same one that already separates decode (sq) from prefill (coop).
+
+The route was landed twice and reverted twice for cause:
+- unbounded (m > 4): regresses m ≥ 16 prefill ~2×;
+- bounded (4 < m ≤ 8) without the `!graph` guard: BC decode graphs abort at capture with the
+  coop autotune sweeping inside the capture (eager run 0 takes msq, warms no coop key; the
+  captured run 1 falls back to a cold coop key) — fixed by serving captured runs too, which
+  then fails at replay with "Graph update failed": the route's staging kernel has pointer
+  arguments the Graph param-update machinery does not record. Making that work means touching
+  graph.cu's site kinds — for a measured batch-8 payoff of 1–2 % aggregate (below the ±3 %
+  bench noise). Reverted per plan gate 9; the batch-8 150–250 target is refuted at the
+  mechanism level (both kernels latency/traffic-bound at m = 8; the cache-sharing roofline
+  requires B resident per call, which 24–32 MB/layer defeats).
+
+### 11.4 Golden-token parity is binary-scoped
+
+A rebuild whose only kernel-source change is dead code (the slice-major block, unreachable at
+m=1) flips 2/8 golden prompts (short_general @ gen-token 20, unicode @ 122). The deployed
+image re-verified EXACT against its own baseline in the same hold (control runs), so the drift
+is codegen, not logic: editing a shared kernel header shifts inlining/register allocation for
+the other kernels in the same translation units, fp16 rounding changes, greedy flips at knife-
+edge decisions. Consequence for every future gate: token equality is only meaningful against
+the same binary; across rebuilds use numcheck-KLD + a quality evaluation. (Also: returned
+logits carry uninitialized channels ≥ actual_vocab_size — 243 NaNs at 248077–248319 in this
+model; trim before any softmax/KLD math, both arms.)
+
+### 11.5 Refuted premises (all measured, all documented in the plan doc §10)
+
+- P4 chunk_size: 2048/4096/8192 TTFT-equivalent on cold 3.2k (3.41–3.48 s ± 1 %) — keep 2048.
+- pp-1.2 persistent buffers: the P1 bisect shows allocation is invisible (all six variants
+  54–60 TF/s, streaming-bound); the prefill gap is the reconstruct→GEMM serialization traffic.
+- T3 batch-4 amortization: cold sq@4 = 4.1× sq@1 — extraction amortization does not reduce
+  DRAM traffic; batch-4 ≈ batch-1 aggregate is traffic-true, not a generator bug.
+- T1 batch-8 via msq route: parity at m=8, regression at m ≥ 16, reverted (11.3).

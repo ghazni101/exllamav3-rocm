@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correctness gate: golden-token parity + batch/sequential equivalence.
+"""Correctness gate: golden-token parity + batch/sequential equivalence + logits KLD.
 
 Modes:
   baseline <out.json>   run the fixed prompt set on the CURRENT build, save token ids
@@ -7,6 +7,14 @@ Modes:
                         exits 1 on any mismatch
   batch     <baseline>  run 4 mid-length prompts sequentially (m<=4 sq GEMV path) and
                         then concurrently (m>1 msq/batched path); sequences must match
+  numcheck  save|compare <path>
+                        capture the first NUMCHECK_STEPS generated-step logits (full
+                        vocab) per prompt. save: store to path (torch.save). compare:
+                        KLD(ref || new) per prompt must be < NUMCHECK_KLD (1e-3) - the
+                        gate for changes that intentionally alter numerics (plan §6.1,
+                        findings-log §10.4.2); token divergence vs the reference run is
+                        reported per prompt. Capture the reference on the incumbent
+                        numerics (e.g. EXL3_INT8_MSQ=0) in the same image.
 
 Greedy decoding is deterministic: any numeric change (grid size, reduction order,
 tiling) shows up as divergent token ids long before it is visible as loss.
@@ -19,6 +27,8 @@ from exllamav3.generator.sampler import GreedySampler
 MODEL_DIR = os.environ.get("EXL3_MODEL", "/models/qwen38-27b")
 CACHE_TOKENS = int(os.environ.get("EXL3_CACHE_TOKENS", "32768"))
 GEN = int(os.environ.get("GATE_GEN_TOKENS", "256"))
+NUMCHECK_STEPS = int(os.environ.get("NUMCHECK_STEPS", "8"))
+NUMCHECK_KLD = float(os.environ.get("NUMCHECK_KLD", "1e-3"))
 
 FILLER = "Machine learning models have grown rapidly in scale over the past decade. "
 BASE = "The history of computing machinery begins in the nineteenth century with "
@@ -85,6 +95,51 @@ def main():
               f"in {time.time()-t_start:.1f}s", flush=True)
         return out
 
+    def run_numcheck():
+        """Prompt set with return_logits: the eos result carries (1, n_steps, vocab) logits.
+        A short warmup generation first, so per-shape JIT/autotune is paid outside any
+        graph-capture window (a capture-time autotune aborts with 'stream is capturing')."""
+        wj = Job(input_ids=tok.encode("Warmup prompt for autotune.", add_bos=True),
+                 max_new_tokens=8, sampler=GreedySampler())
+        generator.enqueue(wj)
+        for r in generator.iterate():
+            if r.get("eos"):
+                break
+        vocab = tok.actual_vocab_size
+        # Only the short prompts: the T1 route changes prefill numerics for m in 5..144
+        # exactly there. The long/reconstruct prompts keep bit-identical numerics and are
+        # covered end-to-end by the golden-token compare; running them here would drag the
+        # chunked-prefill graph capture (and its autotune-during-capture fragility) into the
+        # KLD gate.
+        prompts = [p for p in build_prompts(tok) if not p[0].startswith(("longctx", "prefix"))]
+        tokens, logits = {}, {}
+        t0_ = time.time()
+        for name, ids in prompts:
+            j = Job(input_ids=ids, max_new_tokens=NUMCHECK_STEPS, sampler=GreedySampler(),
+                    return_logits=True)
+            generator.enqueue(j)
+            out_logits = None
+            for r in generator.iterate():
+                if r.get("logits") is not None:
+                    out_logits = r["logits"]
+                if r.get("eos"):
+                    break
+            if out_logits is None:
+                # prefix-cache-hit prompts emit no held logits; their parity is covered by
+                # the golden-token compare (phase B)
+                print(f"[gate] numcheck: no logits emitted for {name} (prefix hit), skipped")
+                continue
+            # trim the padded vocab tail: channels beyond actual_vocab_size are uninitialized
+            lg = out_logits[0, :NUMCHECK_STEPS, :vocab].float().cpu()
+            bad_num = not torch.isfinite(lg).all()
+            logits[name] = lg
+            if bad_num:
+                print(f"[gate] WARNING: non-finite logits in {name} (will fail the gate)")
+            seq = j.sequences[0].sequence_ids.torch().flatten().tolist()
+            tokens[name] = [int(x) for x in seq]
+        print(f"[gate] numcheck: {len(prompts)} prompts x {NUMCHECK_STEPS} steps in {time.time()-t0_:.1f}s", flush=True)
+        return tokens, logits
+
     t0 = time.time()
     if mode in ("baseline", "compare"):
         jobs_spec = [(n, ids, GEN) for n, ids in build_prompts(tok)]
@@ -109,6 +164,48 @@ def main():
                 sys.exit(1)
             print(f"[gate] PASS: all {len(ref)} prompts token-identical ({time.time()-t0:.0f}s)")
 
+    elif mode == "numcheck":
+        sub = sys.argv[2]
+        path = sys.argv[3]
+        tokens, logits = run_numcheck()
+        if sub == "save":
+            torch.save({"tokens": tokens, "logits": logits}, path)
+            print(f"[gate] numcheck reference written to {path}")
+        else:
+            ref = torch.load(path, weights_only=False)
+            rt, rl = ref["tokens"], ref["logits"]
+            worst = 0.0
+            bad = []
+            if len(logits) < 3:
+                print("[gate] NUMCHECK FAIL: fewer than 3 prompts emitted logits")
+                sys.exit(1)
+            for n, lg in logits.items():
+                if n not in rl:
+                    print(f"[numcheck] {n}: not in reference, skipped")
+                    continue
+                rlg = rl[n]
+                k = min(lg.shape[0], rlg.shape[0])
+                if not (torch.isfinite(rlg[:k]).all() and torch.isfinite(lg[:k]).all()):
+                    print(f"[numcheck] {n}: NON-FINITE LOGITS")
+                    bad.append(n)
+                    continue
+                logp_ref = torch.log_softmax(rlg[:k].double(), dim=-1)
+                logp_new = torch.log_softmax(lg[:k].double(), dim=-1)
+                p_ref = logp_ref.exp()
+                # KLD(ref || new); p_ref == 0 terms contribute exactly 0 - mask them so
+                # log-space underflow cannot produce nan in the product
+                kld = (p_ref * (logp_ref - logp_new)).where(p_ref > 0, torch.zeros_like(p_ref)).sum(-1)
+                mk = kld.max().item()
+                worst = max(worst, mk)
+                div = [i for i in range(k) if tokens[n][len(tokens[n]) - k + i] != rt[n][len(rt[n]) - k + i]]
+                print(f"[numcheck] {n}: KLD max {mk:.3e}, divergent steps {div if div else 'none'}")
+                if mk >= NUMCHECK_KLD:
+                    bad.append(n)
+            if bad:
+                print(f"[gate] NUMCHECK FAIL: KLD >= {NUMCHECK_KLD} on {bad} (worst {worst:.3e})")
+                sys.exit(1)
+            print(f"[gate] NUMCHECK PASS: all KLD < {NUMCHECK_KLD} (worst {worst:.3e}, {time.time()-t0:.0f}s)")
+
     elif mode == "batch":
         # 8 mid-length prompts: sequential (m=1, sq GEMV path) vs concurrent (m=8, the
         # msq path for m>4). The m=8 concurrent run is what exercises tg-1b.
@@ -124,7 +221,7 @@ def main():
             "What are the primary greenhouse gases and their main sources?",
         ]
         pids = [tok.encode(t, add_bos=True) for t in ptexts]
-        spec = list(zip(names, pids, [128] * 4))
+        spec = list(zip(names, pids, [128] * len(names)))
         seq = run_jobs(spec, concurrent=False)
         conc = run_jobs(spec, concurrent=True)
         bad = [n for n in names if seq[n] != conc[n]]

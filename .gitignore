@@ -18,3 +18,6 @@ exllamav3/exllamav3_ext/**/*_hip.cpp
 exllamav3/exllamav3_ext/**/*_hip.h
 exllamav3/exllamav3_ext/**/hip_*.cpp
 exllamav3/exllamav3_ext/**/hip_*.h
+
+# regenerable profiling artifacts (harness README: do not commit)
+profiling/out_exec5/

@@ -1143,6 +1143,64 @@ void exl3_gemv_int8_msq_kernel
     int nb256_j = CEIL_DIVIDE(n_j, 256);
     int units_jj = nb256_j * ksplit;
 
+    // Plain single-matrix multi-row calls (batched decode / short-prefill projections through
+    // the exl3_gemm route): every row reads the SAME B, so claim units k-slice-major - one
+    // slice's B (a few MB) is streamed from DRAM once and all rows' units feed it from cache,
+    // instead of each row re-streaming the whole matrix. jj stays inner to the slice so rows
+    // of the same matrix are consecutive; counters keep their per-(jj, nb256) indexing and
+    // each still collects exactly ksplit contributions. The sliced/bundled paths keep the
+    // jj-major walk (different B per jj: no cross-row reuse to exploit).
+    if (size_n_list == nullptr && size_m > 1)
+    {
+        int units_total = ksplit * num_jj * nb256_max;
+        for (int unit = blockIdx.x; unit < units_total; unit += gridDim.x)
+        {
+            int slice = unit / (num_jj * nb256_max);
+            int rem = unit - slice * (num_jj * nb256_max);
+            int jj_r = rem / nb256_max;
+            int nb256 = rem - jj_r * nb256_max;
+            int j_r = jj_r / size_m;
+            int row_r = jj_r - j_r * size_m;
+            int kb0 = slice * rows_per;
+            int nrows = MIN(rows_per, rows_total - kb0);
+
+            int key = jj_r * ksplit + slice;
+            if (key != prev_key)
+            {
+                gemv_int8_stage_slice<1, residual>(A + (size_t) row_r * size_k, 1, size_k, suh_list[j_r],
+                                                   qsums + 4 * key,
+                                                   sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
+                prev_key = key;
+            }
+
+            int* pacc = partials + (size_t) key * pstride;
+            const uint16_t* B_j = B_list[j_r];
+            if constexpr (bits == 4)
+                gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
+            else if constexpr (gemv_int8_stage_smem(bits))
+                gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, n_j);
+            else
+                gemv_int8_unit_narrow<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
+
+            __threadfence();
+            __syncthreads();
+            if (t == 0) sh_last = (atomicAdd(&counters[jj_r * nb256_max + nb256], 1) == ksplit - 1) ? 1 : 0;
+            __syncthreads();
+            if (sh_last)
+            {
+                gemv_int8_epilogue_group_sq<1, c_fp32, residual>(
+                    partials + (size_t) jj_r * ksplit * pstride,
+                    qsums + 4 * jj_r * ksplit, pstride, ksplit,
+                    1, c_fp32 ? (void*) (((float*) C) + (size_t) jj_r * size_n)
+                              : (void*) (((half*)  C) + (size_t) jj_r * size_n),
+                    svh_list[j_r], sh_tmp,
+                    nb256, size_n, n_j);
+                if (t == 0) counters[jj_r * nb256_max + nb256] = 0;
+            }
+        }
+        return;
+    }
+
     for (int unit = blockIdx.x; ; unit += gridDim.x)
     {
         while (unit >= unit_base + units_jj)

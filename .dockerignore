@@ -1,0 +1,14 @@
+# Keep the perf-image build context slim and the extension build honest: a stale
+# build/ tree in the context made setuptools skip the recompile (see Dockerfile.perf)
+build/
+dist/
+*.egg-info
+.git
+.pytest_cache
+profiling/out_*
+profiling/shims
+docs/
+science/
+eval/
+__pycache__/
+**/__pycache__/

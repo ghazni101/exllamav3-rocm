@@ -380,8 +380,13 @@ bool exl3_gemv_int8_msq
                        + (size_t) num_jj * ksplit * pstride;
         ws_ptr = gemv_int8_get_ws(device, ws_ints);
         if (ws_ptr) break;
-        if (rows_per >= rows_max) return false;
-        rows_per = MIN(rows_per * 2, MIN(rows_max, (rows_total + 7) & ~7));
+        // Terminate on saturation, not on rows_max: rows_per caps at (rows_total + 7) & ~7
+        // which can sit below rows_max forever (lm_head at m=32: n=248320 pushes the partials
+        // region past the 16 MB workspace at any slice height) - the old rows_max test spun
+        // the host here, hanging the generator on the first mid-length lm_head call
+        int next_rows_per = MIN(rows_per * 2, MIN(rows_max, (rows_total + 7) & ~7));
+        if (next_rows_per <= rows_per) return false;
+        rows_per = next_rows_per;
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
         smem = smem_for(rows_per);
     }
@@ -417,6 +422,8 @@ bool exl3_gemv_int8_msq
     if (err != cudaSuccess)
     {
         // Nothing was captured: the caller's fallback kernel records its own parameter sites
+        fprintf(stderr, "[msq-launch] declined: grid=%d smem=%zu ksplit=%d rows_per=%d err=%s\n",
+                grid, smem, ksplit, rows_per, cudaGetErrorString(err));
         cudaGetLastError();
         return false;
     }

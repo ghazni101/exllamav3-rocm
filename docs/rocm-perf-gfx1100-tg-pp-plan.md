@@ -656,3 +656,89 @@ Every kernel change re-runs: golden-token compare (m≤4 + reconstruct paths mus
 token-identical), batch-vs-sequential at m=8, the standalone A/B for the touched kernel,
 10-minute no-deadlock soak, bench_lean perf gate (revert if not a measurable win), and a
 `--kernel-trace` confirmation that the intended kernel's share actually moved.
+
+---
+
+---
+
+## 10. Execution status (session 4, 2026-09-16 night → 17)
+
+Scope: §9 sequencing table, steps 1–5 (P4, P1, T1, T2 baseline, T3). Every number below was
+measured on this host under the GPU lock; the serve was stopped for full-VRAM work and was
+restored at session end (deployed image, chunk 2048, warmup entrypoint, healthy).
+
+| step | lever | outcome |
+|---|---|---|
+| 1 | P4 chunk sweep | **NEGATIVE — keep 2048.** Cold 3.2k TTFT 3.41–3.48 s at chunk 2048/4096/8192 (±1 %); decode unchanged. The "second sampler round-trip" premise does not show up at 3.2 k. |
+| 2 | P1 bisect + persistent buffers | **NEGATIVE — pp-1.2 unjustified.** `profiling/pp_bisect.py` over the exact weighted shape inventory: reuse / fresh-b / fresh-c / fresh-all / b-fill / full-model-pattern all land at 54–60 TF/s (run 3×). The probe is streaming-bound over ~1.6 GB of distinct weights per pass; buffer allocation is invisible. The in-model ~30 TF/s equals the streaming ceiling divided by the reconstruct→GEMM serialization factor (~2.5× B-bytes per linear per chunk), i.e. the gap is the fp16 round trip itself, not allocator churn. Justified pp lever is P2 (overlap), deferred. |
+| 3 | T1 msq single-matrix route | **ATTEMPTED, MEASURED, REVERTED (negative).** See §10.1–10.3. |
+| 4 | T2 GEMV tuning | Baseline recorded via the cold-rotation bench: m=1 sq at **525 GB/s (K=4)** / **206–210 GB/s (K=3)**. Tuning sweep deferred (needs kernel-source variants; counters remain unavailable). |
+| 5 | T3 batch-4 amortization | **NEGATIVE — premise refuted.** Cold sq@4 = 4.1× sq@1 (0.233 vs 0.0598 ms; 420–540 GB/s): the M-template amortizes *extraction*, not DRAM traffic — with weights streamed cold, batch-4 must cost ~4× batch-1, so aggregate ≈ b1 is traffic-true behavior, not a generator defect. The ~100-aggregate expectation assumed cache-resident weights. |
+
+### 10.1 Two production bugs found on the way (both fixed on the branch)
+
+1. **Workspace-growth infinite loop** (`exl3_gemv_int8.cu`, msq launcher): the loop grows
+   `rows_per` to shrink the partials region but terminated on `rows_per >= rows_max`, while
+   `rows_per` actually saturates at `(rows_total + 7) & ~7` — below `rows_max` whenever
+   `rows_total < rows_max`. lm_head-shaped calls (n = 248320) with m in (4, 144] spin the host
+   forever (GPU idle, all threads in the next sync) — this is the deterministic half of the
+   original tg-1b "deadlock". Fixed: terminate when `rows_per` stops growing, decline the path.
+2. **Perf images silently shipped the base .so**: `COPY . /opt/exllamav3` carried the repo's
+   stale `build/` tree; setuptools considered the extension current; pip's failure was
+   swallowed by `RUN pip install ... | tail -20`. Every perf image built on 2026-09-16 evening
+   measured the base extension while appearing to rebuild — discovered by a strings-check on
+   the installed .so (zero occurrences of a source marker). `Dockerfile.perf` now removes
+   `build/` in-image, fails loudly on pip errors, and verifies the installed .so contains a
+   marker string from the patched source. `.dockerignore` excludes `build/` et al.
+
+### 10.2 tg-1b done right: what the honest A/B says
+
+With the staging fix (the original patch also passed HOST stack arrays as the msq kernel's
+B/suh/svh pointer *lists* — device-deref fault) and a slice-major unit order for plain
+multi-row calls, the route runs and is deterministic and bit-exact vs the per-row sq kernel
+for K=4 (`profiling/msq_ab2.py`, cold-rotation timing — the rotation matters: a same-tensor
+loop is Infinity-Cache-resident and mis-ranks kernels; in-model weights are cold).
+
+Cold-state verdict at (5120, 12288): **m=8: slice-major msq 0.96–1.05× vs autotuned coop**;
+**m=16/32/128: coop 1.5–2× faster** (its persistent-block phase 2 exploits row-major B reuse);
+**m=5 K=4: msq 1.68–1.72× faster**. The route was tried unbounded (m > 4), then bounded to
+(4, 8]. Batch-8 decode payoff ≈ 1–2 % aggregate — below bench_lean run noise (±3 %) — and the
+BC decode graphs reject the route's staging kernel ("Graph update failed": the staging kernel's
+pointer arguments are not part of the Graph param-update machinery). **Reverted per gate 9.**
+The batch-8 150–250 tok/s target is refuted at the mechanism level: at m = 8 both kernels are
+latency/traffic-bound at ~530–610 GB/s effective; the cache-sharing roofline behind the target
+requires B resident per call, which 24–32 MB/layer defeats.
+
+Kept on the branch (validated, bit-identical outputs on their reachable path): the loop fix,
+and the slice-major unit order inside `exl3_gemv_int8_msq_kernel` for plain multi-row calls
+(reachable only via future callers; production m=1 bundles keep the jj-major walk).
+
+### 10.3 Correctness-gate process findings (change how promotion works)
+
+- **Exact-token parity holds only for binary-identical kernels.** A rebuild whose only kernel
+  change is dead code (the slice-major block, unreachable at m=1) flips 2/8 golden prompts
+  (short_general @ token 20, unicode @ 122) — codegen drift from editing a shared kernel
+  header. The deployed image re-verified exact against its own baseline (control run), so the
+  drift is the rebuild, not the tree's logic. Promotion of any rebuilt extension therefore
+  requires the logits-KLD gate plus a quality evaluation, not token equality.
+- **numcheck gate added** (`correctness_gate.py numcheck save|compare <path>`): captures
+  first-N-step logits via `return_logits`, trims the padded vocab tail (channels ≥
+  `actual_vocab_size` are uninitialized in returned logits — both arms), warms up first.
+  Incumbent-vs-T1 KLD on the 5 short prompts: 1.1–4.1e-3 with zero greedy divergence in 8
+  steps — the per-slice-vs-global activation-scheme delta, the same delta that already exists
+  between decode (sq) and prefill (coop) numerics.
+- **Batch gate fixed**: the 8-prompt spec zipped 8 names with 4 lengths (KeyError on batch_e).
+
+### 10.4 State at end of session
+
+- Standing serve: running, warmed, `tabbyapi-rocm:serve` at chunk 2048 — **unchanged binaries**;
+  the deployed .so re-verified golden-exact this session.
+- Branch `rocm-perf`: loop fix + slice-major msq + Dockerfile hardening + gates/harness
+  (`msq_ab2.py` 3-mode cold A/B, `pp_bisect.py`, `probe_nan.py`, `trace_one.py`,
+  `profile_rocm_batch.py`, `correctness_gate.py numcheck`, `run_exec5a/5b`).
+- Image `exllamav3-rocm:perf-t1` = reverted tree + fixes (not promoted; its only functional
+  deltas are the loop fix and dead slice-major code, and any rebuild drifts token parity).
+- Refuted targets, with evidence: batch-8 aggregate 150–250 (route), prefill 600–900 via
+  pp-1.2 (bisect), batch-4 ~100 (cold-traffic measurement), chunk-size TTFT (sweep).
+  The remaining live levers are T2 (GEMV efficiency — 525/210 GB/s at m=1) and P2 (prefill
+  dequant/GEMM overlap).
