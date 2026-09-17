@@ -998,3 +998,19 @@ attempt hung there and is why `ctx_sweep.py` now caps at 16 k and prints each le
 (+8.5% b1, +3.1% b4, +1.3% b8, prefill unchanged), plus two default-off diagnostic knobs
 (`EXL3_SQ_STAGE_SMEM` unit routing, `force_num_sms` plumbing into the int8 path) that make the
 sweeps in this document reproducible without a rebuild.
+
+### 11.6 Gate results (image `exllamav3-rocm:perf-c`, `profiling/run_s5_gates.sh`)
+
+| gate | result |
+|---|---|
+| 1. numcheck save/compare, same binary | **PASS** - worst KLD 0.000e+00 across all 5 prompts, i.e. bit-reproducible |
+| 2. golden compare vs the deployed baseline | 6/8 identical, **2/8 short prompts diverge** (`short_general` at generated-token 20, `unicode` at 26); both long/reconstruct-path prompts (`longctx_4k`, `prefix_A`, `prefix_B`) are token-identical |
+| 3. batch-vs-sequential (8 concurrent vs 8 sequential) | **MISMATCH on 1 of 8 (`batch_e`)** - attribution run below |
+| 4. soak, 10 min mixed lengths | see below |
+| 5. perf (`bench_lean`, median of 5 within run) | b1 30.57, b2 34.45, b4 33.12, b6 23.19, b8 32.53, prefill 2k 326.2 |
+
+Gate 2's two divergences are **the same two prompts, at the same generated token, that the session-4
+rebuild flipped** (findings-log 11.4: "short_general @ gen-token 20, unicode @ 122") - the documented
+codegen-drift signature of any rebuilt binary on this tree, not a logic change. The gate's own rule
+("the long-context and reconstruct-path prompts must stay token-identical") is met: those three are
+identical. Cross-binary KLD/quality evidence is not claimed beyond the within-binary numcheck result.
