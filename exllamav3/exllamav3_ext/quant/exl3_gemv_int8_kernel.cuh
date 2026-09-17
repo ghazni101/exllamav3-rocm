@@ -683,7 +683,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
 // unit pays an LDS round-trip with no overlap and loses to narrow on gfx1100. Mirror the K=4 wide
 // unit instead: coalesced global loads into VGPRs (48 u32 = 192 B per warp-row), shuffle to the
 // two words ext8w<3> needs, extract in-registers, two-row prefetch. Selected for bits==3 in place
-// of narrow/smem.
+// of narrow/smem. Straight-line body (no device lambdas) — HIP hung the lambda version.
 template <int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_k3
 (
@@ -708,45 +708,52 @@ __device__ __forceinline__ void gemv_int8_unit_k3
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp0 = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
 
-    // Per-lane extract indices into the 24-word circular block (constant across k-rows)
     int t0 = lane << 3;
     int b1 = (t0 + 257) * bits;
     int b0 = b1 - 16;
-    int b2 = b1 + bits * 7;
-    int i0 = b0 / 32;
-    int i2 = (b2 - 1) / 32;
-    int s2 = (i2 + 1) * 32 - b2;
-    i0 = i0 >= 24 ? i0 - 24 : i0;
-    i2 = i2 >= 24 ? i2 - 24 : i2;
+    int b2e = b1 + bits * 7;
+    int i0 = wrap_idx<bits>(b0 / 32);
+    int i2 = wrap_idx<bits>((b2e - 1) / 32);
+    int s2 = (((b2e - 1) / 32) + 1) * 32 - b2e;
+    // s2 from unwrapped i2 boundary (matches ext8w<3>); i0/i2 already wrapped to [0,24)
 
     int c2 = 2 * (lane & 3);
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
-    auto load_row = [&] (int kb, uint32_t& lo, uint32_t& hi)
+    uint32_t lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
+    if (nrows > 0)
     {
-        const uint32_t* row = bp0 + (size_t) kb * row_stride;
-        lo = row[lane];                                 // words 0..31
-        hi = (lane < 16) ? row[32 + lane] : 0u;          // words 32..47
-    };
+        const uint32_t* row = bp0;
+        lo0 = row[lane];
+        hi0 = (lane < 16) ? row[32 + lane] : 0u;
+    }
+    if (nrows > 1)
+    {
+        const uint32_t* row = bp0 + row_stride;
+        lo1 = row[lane];
+        hi1 = (lane < 16) ? row[32 + lane] : 0u;
+    }
 
-    auto word_A = [&] (uint32_t lo, int idx) -> uint32_t
+    for (int kb = 0; kb < nrows; ++kb)
     {
-        return __shfl_sync(0xffffffff, lo, idx);
-    };
-    auto word_B = [&] (uint32_t lo, uint32_t hi, int idx) -> uint32_t
-    {
-        int g = idx + 24;                               // pair-local 24..47
-        return (g < 32) ? __shfl_sync(0xffffffff, lo, g)
-                        : __shfl_sync(0xffffffff, hi, g - 32);
-    };
+        uint32_t lo2 = 0, hi2 = 0;
+        if (kb + 2 < nrows)
+        {
+            const uint32_t* row = bp0 + (size_t) (kb + 2) * row_stride;
+            lo2 = row[lane];
+            hi2 = (lane < 16) ? row[32 + lane] : 0u;
+        }
 
-    auto accumulate = [&] (uint32_t lo, uint32_t hi, int kb)
-    {
-        uint32_t a0 = word_A(lo, i0);
-        uint32_t a1 = word_A(lo, i2);
-        uint32_t b0w = word_B(lo, hi, i0);
-        uint32_t b1w = word_B(lo, hi, i2);
+        // blockA words via shuffle from lo (pair words 0..23 live in lanes 0..23)
+        uint32_t a0 = __shfl_sync(0xffffffff, lo0, i0);
+        uint32_t a1 = __shfl_sync(0xffffffff, lo0, i2);
+        // blockB words: pair 24..47 → lo lanes 24..31 and hi lanes 0..15
+        int g0 = i0 + 24, g2 = i2 + 24;
+        uint32_t b0w = (g0 < 32) ? __shfl_sync(0xffffffff, lo0, g0)
+                                 : __shfl_sync(0xffffffff, hi0, g0 - 32);
+        uint32_t b1w = (g2 < 32) ? __shfl_sync(0xffffffff, lo0, g2)
+                                 : __shfl_sync(0xffffffff, hi0, g2 - 32);
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
         extract8_3bits_words(a0, a1, s2, w0, w1, w2, w3, w4, w5, w6, w7);
@@ -814,17 +821,7 @@ __device__ __forceinline__ void gemv_int8_unit_k3
                 jb1[r] = dp4a_us(w7, bs89.y, jb1[r]);
             }
         }
-    };
 
-    uint32_t lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
-    if (nrows > 0) load_row(0, lo0, hi0);
-    if (nrows > 1) load_row(1, lo1, hi1);
-
-    for (int kb = 0; kb < nrows; ++kb)
-    {
-        uint32_t lo2 = 0, hi2 = 0;
-        if (kb + 2 < nrows) load_row(kb + 2, lo2, hi2);
-        accumulate(lo0, hi0, kb);
         lo0 = lo1; hi0 = hi1;
         lo1 = lo2; hi1 = hi2;
     }
