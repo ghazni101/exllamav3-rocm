@@ -1091,3 +1091,30 @@ int8 path) and the harness/gate fixes (`soak.py` baseline + criterion, `bench_le
 this GPU's practical bandwidth, already using one dp4a per 32 weights, and the measured ceiling for
 this model and quantisation on this card is **~31-35 tok/s aggregate**. The largest real headroom
 found this session is in *prefill*, not decode.
+
+**D2 (re-run, done): the configuration matrix, and the winner is not a compute type.**
+`profiling/d2_gemm_matrix.py`, model prefill shapes at m=2048, rotated buffer pools, the standing
+serve left up (`[svcon]`, `D2_BUDGET_MB` guards the lm_head-sized buffers, which OOM under the serve):
+
+| shape (k, n) | `torch_fp16` (hipBLASLt) | +fp16 reduced-precision reduction | transposed form |
+|---|---|---|---|
+| 5120 x 17408 (mlp gate/up, the dominant shape) | **107.0 TF/s** | 107.8 | 82.3 |
+| 17408 x 5120 (mlp down) | 99.7 | 100.4 | 74.8 |
+| 5120 x 10240 | 101.8 | 101.3 | 77.0 |
+| 5120 x 6144 | 103.7 | 104.8 | 79.2 |
+| 6144 x 5120 | 99.6 | 99.9 | 79.0 |
+| 5120 x 12288 (q_proj) | 103.8 | 103.8 | 77.5 |
+
+Same hardware, same shapes, same fp16 inputs: **99.6-107.8 TFLOP/s through hipBLASLt vs the ext's
+28.5 TFLOP/s in-model** (D1) - a **3.7x gap on the shape that is 68% of prefill device time**.
+Reduced-precision reduction changes nothing (<=1%) and the transposed form is worse, so the lever is
+*algorithm/backend selection*, not the compute type, and it needs no numerical change.
+
+**Implementation started, env-gated, default off:** `EXL3_HGEMM_ATEN=1` routes
+`hgemm_gemmex_impl` through `at::mm_out` (which dispatches to hipBLASLt on this stack) with
+fp16-reduced-precision reduction forced off so accumulation stays fp32 as in the incumbent path
+(`exllamav3_ext/hgemm.cu`). It deliberately does **not** ship on this measurement alone: the plan's
+rule is that a change ships only if the end-to-end metric moves on its own build, and ATen may
+allocate a reduction workspace, which is not safe inside the captured decode graphs - so the
+incumbent path stays the default until the A/B below is green. Measured outcome of that A/B:
+see §11.8.

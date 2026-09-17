@@ -73,6 +73,15 @@ for (k, n) in SHAPES:
     nelem = per // 2
     nbuf = max(2, (n * k) // nelem + 1)
     nbuf = min(nbuf, 3)
+    # VRAM guard: with the standing serve up (svcon), only a few GB are free, so shrink or skip the
+    # giant shapes (lm_head-sized B buffers are 2.5 GB each) instead of OOMing mid-matrix
+    budget_mb = float(os.environ.get("D2_BUDGET_MB", "3000"))
+    if nbuf * n * k * 2 / 2 ** 20 > budget_mb:
+        nbuf = max(1, int(budget_mb // (n * k * 2 / 2 ** 20)))
+    if nbuf < 1:
+        print(f"  k={k:6d} n={n:6d} SKIPPED (one B buffer exceeds the {budget_mb:.0f} MB budget)")
+        rows.append(dict(k=k, n=n, skipped="vram"))
+        continue
     bs = [torch.randn((n, k), dtype=torch.half, device="cuda:0") * 0.02 for _ in range(nbuf)]
     pool_mb = nbuf * n * k * 2 / 2 ** 20
     flops = 2.0 * M * k * n
