@@ -157,6 +157,19 @@ static int exl3_sq_stage_arg()
     return v < 0 ? -1 : (v ? 1 : 0);
 }
 
+// EXL3_SQ_GRID_MULT scales the occupancy-derived sq/msq grid (1 = default, cap 8). Used with the
+// raised 2048 block cap so wide tensors can keep more tiles in flight without a rebuild.
+static int exl3_sq_grid_mult()
+{
+    static const int v = []
+    {
+        const char* e = getenv("EXL3_SQ_GRID_MULT");
+        int n = e ? atoi(e) : 1;
+        return n < 1 ? 1 : (n > 8 ? 8 : n);
+    }();
+    return v;
+}
+
 // m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
 // cooperative kernel (and from there to the regular fp16 kernel).
 static bool exl3_gemv_int8_sq
@@ -244,7 +257,8 @@ static bool exl3_gemv_int8_sq
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
         gemv_occ_cache[device][occ_key] = maxb;
     }
-    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    // Cap raised 1024→2048; EXL3_SQ_GRID_MULT scales occupancy-derived grid (see exl3_sq_grid_mult).
+    int grid = MIN(MAX(maxb, 1) * num_sms * exl3_sq_grid_mult(), 2048);
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
     if (ksplit > SQ_KSPLIT_CAP) return false;
@@ -389,7 +403,7 @@ bool exl3_gemv_int8_msq
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
         gemv_occ_cache[device][occ_key] = maxb;
     }
-    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    int grid = MIN(MAX(maxb, 1) * num_sms * exl3_sq_grid_mult(), 2048);
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
 
