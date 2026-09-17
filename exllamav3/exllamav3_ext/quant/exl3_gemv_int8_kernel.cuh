@@ -748,12 +748,16 @@ __device__ __forceinline__ void gemv_int8_unit_k3
         // blockA words via shuffle from lo (pair words 0..23 live in lanes 0..23)
         uint32_t a0 = __shfl_sync(0xffffffff, lo0, i0);
         uint32_t a1 = __shfl_sync(0xffffffff, lo0, i2);
-        // blockB words: pair 24..47 → lo lanes 24..31 and hi lanes 0..15
+        // blockB words: pair 24..47 → lo lanes 24..31 and hi lanes 0..15.
+        // BOTH shfls must execute on every lane — a divergent ternary around
+        // __shfl_sync deadlocks the warp (A15 hang).
         int g0 = i0 + 24, g2 = i2 + 24;
-        uint32_t b0w = (g0 < 32) ? __shfl_sync(0xffffffff, lo0, g0)
-                                 : __shfl_sync(0xffffffff, hi0, g0 - 32);
-        uint32_t b1w = (g2 < 32) ? __shfl_sync(0xffffffff, lo0, g2)
-                                 : __shfl_sync(0xffffffff, hi0, g2 - 32);
+        uint32_t b0_lo = __shfl_sync(0xffffffff, lo0, (g0 < 32) ? g0 : 0);
+        uint32_t b0_hi = __shfl_sync(0xffffffff, hi0, (g0 >= 32) ? (g0 - 32) : 0);
+        uint32_t b1_lo = __shfl_sync(0xffffffff, lo0, (g2 < 32) ? g2 : 0);
+        uint32_t b1_hi = __shfl_sync(0xffffffff, hi0, (g2 >= 32) ? (g2 - 32) : 0);
+        uint32_t b0w = (g0 < 32) ? b0_lo : b0_hi;
+        uint32_t b1w = (g2 < 32) ? b1_lo : b1_hi;
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
         extract8_3bits_words(a0, a1, s2, w0, w1, w2, w3, w4, w5, w6, w7);
