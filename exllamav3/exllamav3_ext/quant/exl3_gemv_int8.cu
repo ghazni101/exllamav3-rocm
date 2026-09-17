@@ -49,6 +49,11 @@ bool exl3_gemv_int8_msq_enabled()
 // and keeps the conservative gate. Hopper's fp16 kernel is per-SM INT-throughput-bound at K = 6
 // (H200, issue #242: +26/+57% per call, +16% e2e), and Blackwell measures the same way (5090:
 // +7..+19% at K=6 across shapes, fp16 kernel at only ~65-78% of DRAM peak; K=7/8 are flat).
+// RDNA3 (gfx1100) is like Hopper: the K=6 coop fp16 kernel is latency-bound (lm_head 9.18 ms/call
+// vs a ~1.0 ms bandwidth floor), and raising the gate to 6 moved the 27B Qwen3.8-3.5bpw e2e decode
+// from 22.83 to 31.02 tok/s median (+38.5%) with full golden-token parity (2026-09-17, 4096/256,
+// single measured K=6 shape: lm_head k=5120/n=248320). gfx1101 is unmeasured; override with
+// EXL3_INT8_GEMV_MAX_K to test there.
 // EXL3_INT8_GEMV_MAX_K overrides the per-arch default for testing on unmeasured parts (kernel
 // instances exist up to K = 8; at m == 1, K = 7..8 fall through to the cooperative kernel)
 int exl3_gemv_int8_max_k(int device)
@@ -56,7 +61,7 @@ int exl3_gemv_int8_max_k(int device)
     static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
     if (env_max_k) return MIN(env_max_k, 8);
     int cc = DevCtx::instance().get_cc(device);
-    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+    return (cc == CC_HOPPER || cc == CC_BLACKWELL || cc == CC_RDNA3) ? 6 : 5;
 }
 
 struct GemvInt8Workspace
