@@ -623,9 +623,8 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 
 // Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
 // processed sequentially with pointer-based extraction straight from global memory.
-// Soft-pipeline depth 2: kick the next row's block-pair loads before extracting the current row
-// so DRAM request latency overlaps the current row's dp4a work. Leave-off for gfx1100 when the
-// smem-staged unit loses to narrow (plan T2): outstanding loads, not ALU.
+// Soft-prefetch (A12) rejected: -29% TG on gfx1100 (32.95->23.40); volatile early touches
+// hurt more than they hid latency. Leave unit as pure sequential extract.
 template <int bits, int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_narrow
 (
@@ -651,24 +650,8 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
-    // Prefetch touch: two lanes open the first 16 B of each block so the rest of the warp's
-    // scattered ext8w loads ride an already-started DRAM burst. Volatile keeps the load alive.
-    auto prefetch_row = [&] (int kb)
-    {
-        const uint32_t* row = bp + (size_t) kb * row_stride;
-        if ((lane & 15) == 0)
-        {
-            volatile uint32_t sink = row[(lane >> 4) * 4];
-            (void) sink;
-            volatile uint32_t sink2 = (row + 8 * bits)[(lane >> 4) * 4];
-            (void) sink2;
-        }
-    };
-
-    if (nrows > 0) prefetch_row(0);
     for (int kb = 0; kb < nrows; ++kb)
     {
-        if (kb + 1 < nrows) prefetch_row(kb + 1);
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
         gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
