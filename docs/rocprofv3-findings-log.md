@@ -759,3 +759,74 @@ Fix shipped: `EXL3_HGEMM_F16OUT` (default on) runs the fp32-output GEMM into an 
 it. In-extension 4.8-5.0x per shape; end-to-end prefill 2k 324.7/345.3 -> 562.0/511.1 tok/s with
 decode and every batch aggregate unchanged; worst model-level KLD 1.9e-3, zero greedy divergence in
 8 steps, determinism bit-exact. Full numbers and gates: plan doc section 11.8.
+
+## 14. Session 7 (2026-09-18): guided-goal continuation — 32.95 -> 34.6 tok/s, and a build-system landmine
+
+Branch `guided-goal/qwen38-35bpw-50tps`, Qwen3.8-27B-EXL3-3.5bpw, RX 7900 XTX, harness
+`profiling/guided_tg.py` (4096/256, b1 greedy). Session baseline: perf-final image = 32.95 tok/s
+(reproduced 32.93/33.00/32.88 across holds), parity green.
+
+### 14.1 The build-system landmine (read this before trusting any goal-session number)
+
+`Dockerfile.goal` was authored against `Dockerfile.rocm10`'s documented `/opt/venv`, but the
+perf-final lineage's venv is **`/opt/rocm-venv`** — and its `python3` resolves there too. The
+first four goal images (goal-a16..a20) therefore **never installed anything**: the pip step died
+with "/opt/venv/bin/pip: not found", masked by `| tail -5`, and every one of those images silently
+benchmarked the stale perf-final binary + stale Python copy. Symptoms that gave it away: the
+EXL3_SQ_STAGE_SMEM arms behaved like the *old* parser semantics (stage=2/3 both = "stage all"),
+the EXL3_SQ_ROWS_PER_NARROWN and triton_paged file-mount arms were exact no-ops, and a baked-in
+Python default flip (bc_attn) had no effect while the env var worked. Any docker image that
+overrides a venv path MUST carry a staleness guard; Dockerfile.goal now runs
+`python3 -c "import ...bc_attn as b; assert b.bc_attn_enable is False"` + a torch-first
+`import exllamav3_ext` after install (the bare ext import fails on libc10 even when fine).
+
+Consequences for the record: A16/A17's published conclusions ("K=4 staged/narrow units lose 5%")
+were actually *stage-all-(K3/5/7)* arms on the old parser — K=4-staged was only ever measured for
+real on goal-b1 (31.25, still a loss). The A18 rows-per-narrow sweep and the attention
+splits/warps e2e arms were no-ops and were re-run for real on goal-b1/b2 (still no win: n96
+33.18 = -4.5%, m16 34.18 = -1.6%). The gdn_ba vectorization "no e2e effect" reading was wrong —
+on the correct binary it is worth -0.83 ms/token (14.1 below).
+
+### 14.2 A19 (kept): the captured BC attention block replays slower than eager on gfx1100
+
+`EXL3_BC_ATTN=0` on the stale binary: 34.07-34.20 across five runs vs 32.84-32.98 for BC-on
+across five runs, all parity-green, both arm orders — clean +3.7%. The per-kernel trace shows
+where it comes from: the eager dispatch path's `_paged_attn_decode_split_kernel` runs at 55 us
+per call vs ~129 us inside the captured block (2.06 -> 0.89 ms/token for the 16 full-attention
+layers); the combine pass is slightly bigger (+0.06) and the host gap shrinks 4.9 -> 4.0 ms.
+Defaulted off for ROCm in bc_attn.py (`torch.version.hip` guard); EXL3_BC_ATTN=1 restores.
+
+### 14.3 A21 (kept): the A14 `launch_bounds(256,4)` soft-keep is a regression on current codegen
+
+goal-b1 (fresh install, all committed sources) measured 32.97 with `__launch_bounds__(256,4)`
+vs 34.74 without (goal-b2) — a ~1.8 tok/s swing from the same source delta A14 had measured at
++0.32%. The forced minBlocksPerSM=4 caps the sq/msq kernels below their natural 80-VGPR
+allocation ("natural register allocation measures faster", plan doc §11.2 — again). Reverted to
+plain bounds; A14's soft-keep is hereby revoked.
+
+### 14.4 A20 (kept): gdn_ba_gemv vectorized
+
+The merged b/a projection GEMV ran one warp per output feature with 4 B half2 loads —
+21.5 us/call x 48 GDN layers = 1.03 ms/token at ~30 GB/s effective, pure load latency. float4
+loads (k%8 tail falls back to half2) cut it to ~4.2 us/call: 1.03 -> 0.20 ms/token in the final
+trace. Parity green.
+
+### 14.5 Shipped state and the remaining budget
+
+goal-b2 defaults: **34.53 / 34.60 / 34.61 / 34.74 tok/s** across four independent runs, token
+parity green throughout. Final trace (out_guided/b2-trace): wall 30.4 ms/token under profiling
+overhead (28.9 unprofiled), device busy 26.0 ms, host gap 4.4 ms over ~921 launches/token.
+Composition per token: sq GEMV 17.0 ms + msq GEMV 5.7 ms (22.7 ms = 87% of busy),
+paged-attn split+combine 1.0 ms, GDN chain ~1.3 ms (ba now 0.20, recurrent 0.68, conv 0.21,
+fused ops ~0.2), rms/gated norms 0.68 ms, elementwise+rope+misc ~0.3 ms.
+
+Per-shape GEMV bandwidth (trace x model map, A18 analysis): lm_head K6 n=248320 runs at
+~795 GB/s; GDN msq bundles ~645; K3 MLP ~566; gate/up/q (n>=12288) ~540; attn q/k/v msq
+bundles ~446; down_proj/o_proj K4 (n=5120) ~340-370. The 22.7 ms GEMV block is the whole game
+for 50 tok/s: it needs ~14 ms, i.e. ~800 GB/s average across shapes that have now resisted
+unit type (wide/narrow/smem), slice height (24..128 global + narrow-only), grid multiplier,
+prefetch depth, occupancy forcing, and BC-graph capture. The untried levers are all
+structural: graph-capturing the whole decode step (gap 4.4 -> ~1 ms), fusing the residual-add +
+rms_norm and GDN micro-chain (~1 ms device + ~300 launches), and a fundamentally different
+weight-streaming scheme for the small-n shapes (n=5120 down/o family at half the bandwidth of
+the same-size wide-n matrices, no configuration sensitivity found).
