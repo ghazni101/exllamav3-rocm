@@ -154,7 +154,8 @@ static int exl3_sq_stage_arg()
         const char* e = getenv("EXL3_SQ_STAGE_SMEM");
         return e ? atoi(e) : -1;
     }();
-    return v < 0 ? -1 : (v ? 1 : 0);
+    if (v < 0) return -1;
+    return v > 3 ? 3 : v;       // 0 = off, 1 = stage all K, 2 = stage K4, 3 = K4 narrow
 }
 
 // EXL3_SQ_GRID_MULT scales the occupancy-derived sq/msq grid (1 = default, cap 8). Used with the
@@ -204,6 +205,19 @@ static bool exl3_gemv_int8_sq
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif
+    // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
+    // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
+    // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
+    // the column parallelism that wide-n shapes need. EXL3_SQ_ROWS_PER_NARROWN overrides
+    // rows_per for launches with size_n/256 < 48 (0 = off). In the msq path size_n is the bundle
+    // max width.
+    static const int rows_per_narrown = []
+    {
+        const char* e = getenv("EXL3_SQ_ROWS_PER_NARROWN");
+        return e ? atoi(e) : 0;
+    }();
+    if (rows_per_narrown > 0 && size_n / 256 < 48)
+        rows_per_arg = MAX((rows_per_narrown + 7) & ~7, SQ_MINROWS);
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -362,6 +376,19 @@ bool exl3_gemv_int8_msq
 #else
     int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
 #endif
+    // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
+    // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
+    // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
+    // the column parallelism that wide-n shapes need. EXL3_SQ_ROWS_PER_NARROWN overrides
+    // rows_per for launches with size_n/256 < 48 (0 = off). In the msq path size_n is the bundle
+    // max width.
+    static const int rows_per_narrown = []
+    {
+        const char* e = getenv("EXL3_SQ_ROWS_PER_NARROWN");
+        return e ? atoi(e) : 0;
+    }();
+    if (rows_per_narrown > 0 && size_n / 256 < 48)
+        rows_per_arg = MAX((rows_per_narrown + 7) & ~7, SQ_MINROWS);
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
     {
         int r = CEIL_DIVIDE(rows_total * nb256_max, grid_);

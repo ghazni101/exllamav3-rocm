@@ -39,7 +39,11 @@ fall back to the dispatch path by design (build_bc_attn returns None); unexpecte
 while building the path raise.
 """
 
-bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
+# ROCm/gfx1100 (2026-09-18, Qwen3.8-27B-3.5bpw, 4096/256 TG): the captured BC block replays
+# 3.5% SLOWER than the eager dispatch path (34.14 vs 32.98 tok/s median, token parity green,
+# reproduced). The eager triton decode attention wins on RDNA3 - default the path off there.
+_bc_attn_default = "0" if torch.version.hip else "1"
+bc_attn_enable = os.environ.get("EXL3_BC_ATTN", _bc_attn_default) != "0"
 
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"

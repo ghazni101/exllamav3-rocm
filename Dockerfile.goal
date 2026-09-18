@@ -1,0 +1,11 @@
+# Goal-session build: reuse the perf-final toolchain layer (the local/rocm-base:10.0.0
+# base was pruned); wipe the tree, copy fresh sources, rebuild the HIP extension.
+FROM exllamav3-rocm:perf-final
+
+WORKDIR /opt/exllamav3
+RUN rm -rf /opt/exllamav3
+COPY . /opt/exllamav3
+RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=gfx1100 MAX_JOBS=16 \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -5
+
+ENV EXL3_MODEL=/models/qwen38-27b

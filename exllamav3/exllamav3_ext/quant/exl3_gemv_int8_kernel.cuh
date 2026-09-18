@@ -745,7 +745,7 @@ __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 
 __host__ __device__ constexpr bool gemv_int8_reserve_stage(int bits, int stage_arg)
 {
-    return gemv_int8_stage_smem(bits) || stage_arg == 1;
+    return gemv_int8_stage_smem(bits) || stage_arg == 1 || (stage_arg >= 2 && bits == 4);
 }
 
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
@@ -1056,7 +1056,11 @@ void exl3_gemv_int8_sq_kernel
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
     // Mirrors the host's smem_for(): the stage region is where the host reserved it
     float* sh_tmp = (float*) (sh_b + (gemv_int8_reserve_stage(bits, stage_arg) ? GEMV_STAGE_D * 8 * 16 * bits : 0));
-    bool use_smem = stage_arg < 0 ? gemv_int8_stage_smem(bits) : stage_arg != 0;
+    // stage_arg: -1 = per-arch routing; 0 = arch routing with staging off (wide K4, narrow else);
+    // 1 = stage every K; 2 = stage K4 only; 3 = K4 through the generic narrow unit (A17 - the
+    // narrow unit already out-streams the wide one on the same-size K=3 shapes: 566 vs 463 GB/s)
+    bool use_smem = stage_arg < 0 ? gemv_int8_stage_smem(bits)
+                                  : (stage_arg == 1 || (stage_arg == 2 && bits == 4));
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1076,7 +1080,14 @@ void exl3_gemv_int8_sq_kernel
         }
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
+        {
+            if (use_smem)
+                gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
+            else if (stage_arg == 3)
+                gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
+            else
+                gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
+        }
         else if (use_smem)
             gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
         else
