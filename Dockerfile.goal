@@ -1,11 +1,18 @@
 # Goal-session build: reuse the perf-final toolchain layer (the local/rocm-base:10.0.0
 # base was pruned); wipe the tree, copy fresh sources, rebuild the HIP extension.
+# NOTE: the venv in the perf-final lineage is /opt/rocm-venv (NOT /opt/venv), and python3
+# resolves there too — an install into any other prefix is silently ignored, and a failed
+# pip masked by a pipe gives you a stale-binary image that still benchmarks.
 FROM exllamav3-rocm:perf-final
+SHELL ["/bin/bash", "-c"]
 
 WORKDIR /opt/exllamav3
 RUN rm -rf /opt/exllamav3
 COPY . /opt/exllamav3
 RUN EXLLAMA_VERBOSE=1 PYTORCH_ROCM_ARCH=gfx1100 MAX_JOBS=16 \
-    /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . 2>&1 | tail -5
+    /opt/rocm-venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation . > /tmp/pip.log 2>&1; \
+    rc=$?; tail -3 /tmp/pip.log; exit $rc
+RUN python3 -c "import exllamav3.modules.attention_fn.bc_attn as b; assert b.bc_attn_enable is False, 'stale python copy!'" && \
+    python3 -c "import torch, exllamav3_ext" && echo INSTALL_VERIFIED
 
 ENV EXL3_MODEL=/models/qwen38-27b

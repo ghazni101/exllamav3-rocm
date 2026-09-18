@@ -1008,7 +1008,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 #endif
 
 template <int bits, int M, bool c_fp32, bool residual>
-__global__ __launch_bounds__(NUM_THREADS, 4)  // A14: ask for >=4 resident blocks/SM (T2 occupancy lever)
+__global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
     const half* __restrict__ A,
@@ -1121,7 +1121,7 @@ void exl3_gemv_int8_sq_kernel
 // widths only need to be multiples of 128 - tail warps/128-spans exit on the n_j bound.
 
 template <int bits, bool c_fp32, bool residual>
-__global__ __launch_bounds__(NUM_THREADS, 4)  // A14: ask for >=4 resident blocks/SM (T2 occupancy lever)
+__global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_msq_kernel
 (
     const half* __restrict__ A,
@@ -1314,7 +1314,7 @@ void exl3_gemv_int8_msq_kernel
 // Cooperative kernel: same argument list as exl3_gemm_kernel
 
 template <int bits, bool c_fp32, bool residual>
-__global__ __launch_bounds__(NUM_THREADS, 4)  // A14: ask for >=4 resident blocks/SM (T2 occupancy lever)
+__global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_coop_kernel
 (
     const half* __restrict__ A,
