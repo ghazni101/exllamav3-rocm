@@ -11,7 +11,7 @@
 // the mul1 codebook is affine in a byte-sum, so dequantization and the activation product
 // fuse into integer dot products (see exl3_moe_cpu_forward for the math).
 //
-// Current limits: mul1 codebook only, K in [1, 8]. Gated experts with silu/gelu/swiglu_oai
+// Current limits: mul1 codebook only, K in [1, 8] or a half-integer rate 1.5 / 2.5 / 3.5. Gated experts with silu/gelu/swiglu_oai
 // (act_limit) or gateless with relu2; optional per-expert biases (uniform per projection).
 
 struct MoeCpuMatrix
@@ -22,7 +22,8 @@ struct MoeCpuMatrix
     const at::Half* bias;   // nullable; added after the output transform
     int k;
     int n;
-    int bits;
+    int bits;               // bits per weight, integer part
+    int hb = 0;             // half-integer rate: bits + 0.5
     // Band-contiguous ("swizzled") trellis layout: tile (kt, nt) stored at group nt/8, then
     // kt, then member nt%8, so each 8-tile output band reads as one sequential k-stream
     int swz = 0;
@@ -112,6 +113,8 @@ void exl3_moe_cpu_stage_experts
 // Per-phase profiling of the compute pool, reported to stdout every 512 jobs. Set once at
 // worker startup from MoeCpuTuning.cpu_prof (EXL3_MOE_CPU_PROF env).
 void exl3_moe_cpu_set_prof(bool enabled);
+// Wake helpers before the GPU payload arrives; no work or completion barrier.
+void exl3_moe_cpu_pool_prime(int threads);
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
