@@ -11,13 +11,15 @@
 #     carries delta.role="assistant"
 #   - client disconnect cancels the job (streaming and non-streaming)
 import os, re, time, uuid, json, queue, threading, asyncio
+import concurrent.futures
 import jinja2, jinja2.sandbox, jinja2.ext
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Union
 
-from serve_rocm import app, state, _lock, MODEL_DIR, submit_job, cancel_job, finish_job, MAX_TOKENS
+from serve_rocm import (app, state, _lock, MODEL_DIR, submit_job, cancel_job,
+                        finish_job, MAX_TOKENS, MAX_QUEUE, _job_queues, QueueFull)
 
 # Omitted max_tokens used to default to the full cache (200k here). Non-streaming
 # chat then generated until EOS/cache, and thinking hid visible content for that
@@ -39,6 +41,13 @@ app.add_middleware(
 MODEL_NAME = os.environ.get("EXL3_MODEL_NAME", os.path.basename(MODEL_DIR.rstrip("/")))
 THINK_CLOSE = "</think>"
 THINK_TAIL = len(THINK_CLOSE) - 1  # hold-back for partial-tag chunk boundaries
+
+# Blocking queue-drains (one per in-flight generation) run on this dedicated pool
+# instead of asyncio's default executor: borrowing the default pool for the whole
+# duration of every generation starved to_thread users (encode, SSE q.get) under
+# load and stalled unrelated requests.
+_collect_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=MAX_QUEUE + 8, thread_name_prefix="exl3-collect")
 
 # --- chat template (jinja2, mirroring transformers' environment) ----------
 
@@ -182,6 +191,10 @@ class CompletionReq(BaseModel):
 def _make_sampler(r) -> object:
     if (r.temperature or 0) == 0.0:
         return GreedySampler()
+    # NaN passes neither comparison; extreme values overflow logits to inf and
+    # degenerate every sample - reject at the boundary instead
+    if not (0.0 < r.temperature <= 16.0):
+        raise ValueError(f"temperature out of range: {r.temperature!r}")
     logit_bias = None
     if r.logit_bias:
         try:
@@ -230,10 +243,20 @@ def _run_job(prompt_ids, max_new_tokens, sampler, stop_conds, seed, out_q, cance
                 r = jq.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if r.get("stage") == "error":
+                # Reaped job (prefill OOM, page-accounting failure, dead driver):
+                # report as an error, NOT as a successful empty completion
+                out_q.put(("err", RuntimeError(str(r.get("error") or "generation failed"))))
+                break
             if r.get("text"):
                 out_q.put(("text", r["text"]))
             if r.get("eos"):
                 result = r
+                held = r.get("held") or {}
+                if held.get("text"):
+                    # stop-string EOS emits held-back text only here; without this
+                    # the tail of the completion is silently truncated
+                    out_q.put(("text", held["text"]))
                 break
         if cancel_ev.is_set() and not result:
             # Aborted mid-flight: remove the job so it doesn't keep
@@ -241,6 +264,8 @@ def _run_job(prompt_ids, max_new_tokens, sampler, stop_conds, seed, out_q, cance
             cancel_job(job, serial)
         else:
             finish_job(serial)
+        # Unconditional: a collector abandoned by a client disconnect is still
+        # blocked on q.get() in its thread - this is what releases it
         out_q.put(("done", result))
     except Exception as e:
         if serial is not None:
@@ -265,15 +290,27 @@ def _usage(prompt_tokens: int, new_tokens: int) -> dict:
 def _start_generation(prompt_text, req, max_tokens_default, seed_offset: int = 0):
     """Encode prompt, spawn worker, return (queue, cancel_event, prompt_tokens).
     Default max_new_tokens = remaining cache (vLLM: context_window - prompt)."""
+    # Backpressure: reject before encoding when the queue is saturated (each
+    # queued job holds prompt tensors; unbounded queueing exhausts the host)
+    with _lock:
+        n_queued = len(_job_queues)
+    if n_queued >= MAX_QUEUE:
+        raise QueueFull(f"{n_queued} jobs already queued (EXL3_MAX_QUEUE={MAX_QUEUE})")
     tok = state["tokenizer"]
     ids = tok.encode(prompt_text, encode_special_tokens=True)
     n_prompt = ids.shape[1]
     if n_prompt >= MAX_TOKENS:
         raise ValueError(f"prompt uses {n_prompt} of {MAX_TOKENS} cache tokens")
-    max_new = getattr(req, "max_completion_tokens", None) or req.max_tokens or max_tokens_default
+    # Explicit 0 must mean 0, not fall through to the default (falsy-`or` bug);
+    # completion_tokens wins over max_tokens per OpenAI spec
+    max_new = next((v for v in (getattr(req, "max_completion_tokens", None),
+                                req.max_tokens) if v is not None), max_tokens_default)
     # n>1: vary the seed per choice so identical seeds don't clone outputs
     seed = None if req.seed is None else req.seed + seed_offset
-    max_new = min(max_new, MAX_TOKENS - n_prompt)
+    # The Job reserves max_new + 1 tokens of headroom and page-aligns the
+    # reservation up, so clamping to MAX_TOKENS - n_prompt exactly overflows the
+    # page budget at the boundary (129 of 128 pages); leave the +1
+    max_new = min(max_new, MAX_TOKENS - n_prompt - 1)
     if max_new < 1:
         raise ValueError(f"prompt uses {n_prompt} of {MAX_TOKENS} cache tokens; no room to generate")
     q = queue.Queue()
@@ -305,7 +342,8 @@ def _collect(q):
 async def _collect_with_abort(q, cancel_ev, request: Request):
     """_collect with client-disconnect abort. Returns (text, result) or
     raises ClientDisconnect."""
-    task = asyncio.create_task(asyncio.to_thread(_collect, q))
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(loop.run_in_executor(_collect_pool, _collect, q))
     while not task.done():
         if await request.is_disconnected():
             cancel_ev.set()  # worker cancels its own job on exit
@@ -426,6 +464,7 @@ async def _sse_stream(q, cancel_ev, request: Request, kind: str, split_think: bo
     created = int(time.time())
     splitter = ThinkSplitter() if (split_think and kind == "chat") else None
     new_tokens = 0
+    loop = asyncio.get_running_loop()
     try:
         # First chunk carries the role, per OpenAI/vLLM convention
         if kind == "chat":
@@ -434,7 +473,7 @@ async def _sse_stream(q, cancel_ev, request: Request, kind: str, split_think: bo
             if await request.is_disconnected():
                 return
             try:
-                typ, payload = await asyncio.to_thread(q.get, True, 0.05)
+                typ, payload = await loop.run_in_executor(_collect_pool, q.get, True, 0.05)
             except queue.Empty:
                 continue
             if typ == "job":
@@ -529,7 +568,10 @@ async def chat_completions(req: ChatReq, request: Request):
 
     if req.stream:
         try:
-            q, cancel_ev, n_prompt = _start_generation(prompt, req, DEFAULT_MAX_NEW)
+            q, cancel_ev, n_prompt = await asyncio.to_thread(
+                _start_generation, prompt, req, DEFAULT_MAX_NEW)
+        except QueueFull as e:
+            return _err(str(e), 503)
         except Exception as e:
             return _err(str(e))
         return StreamingResponse(
@@ -544,15 +586,18 @@ async def chat_completions(req: ChatReq, request: Request):
     total_prompt = total_new = 0
     for i in range(n):
         try:
-            q, cancel_ev, n_prompt = _start_generation(prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
+            q, cancel_ev, n_prompt = await asyncio.to_thread(
+                _start_generation, prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
             text, result = await _collect_with_abort(q, cancel_ev, request)
         except ClientDisconnect:
             return JSONResponse(status_code=499, content={})
+        except QueueFull as e:
+            return _err(str(e), 503)
         except ValueError as e:
             return _err(str(e))
         except Exception as e:
             return JSONResponse({"error": {"message": str(e), "type": "server_error"}}, 500)
-        total_prompt += n_prompt
+        total_prompt = n_prompt  # reported once for n choices, per OpenAI spec
         total_new += result.get("new_tokens", 0)
 
         reasoning, content = split_thinking(text, think)
@@ -588,7 +633,10 @@ async def completions(req: CompletionReq, request: Request):
 
     if req.stream:
         try:
-            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, DEFAULT_MAX_NEW)
+            q, cancel_ev, n_prompt = await asyncio.to_thread(
+                _start_generation, req.prompt, req, DEFAULT_MAX_NEW)
+        except QueueFull as e:
+            return _err(str(e), 503)
         except Exception as e:
             return _err(str(e))
         return StreamingResponse(
@@ -602,15 +650,18 @@ async def completions(req: CompletionReq, request: Request):
     total_prompt = total_new = 0
     for i in range(n):
         try:
-            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
+            q, cancel_ev, n_prompt = await asyncio.to_thread(
+                _start_generation, req.prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
             text, result = await _collect_with_abort(q, cancel_ev, request)
         except ClientDisconnect:
             return JSONResponse(status_code=499, content={})
+        except QueueFull as e:
+            return _err(str(e), 503)
         except ValueError as e:
             return _err(str(e))
         except Exception as e:
             return JSONResponse({"error": {"message": str(e), "type": "server_error"}}, 500)
-        total_prompt += n_prompt
+        total_prompt = n_prompt  # reported once for n choices, per OpenAI spec
         total_new += result.get("new_tokens", 0)
         choices.append({
             "index": i,
@@ -630,4 +681,6 @@ async def completions(req: CompletionReq, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("serve_openai:app", host="0.0.0.0", port=int(os.environ.get("PORT", "9001")))
+    # Pass the app object: the "serve_openai:app" import string re-imports this
+    # module under its own name, double-registering routes and middleware
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "9001")))

@@ -56,6 +56,10 @@ RUN python3 -c "import torch, exllamav3_ext" && echo INSTALL_VERIFIED && \
 
 ENV EXL3_MODEL=/models/qwen38-27b
 ENV EXL3_CACHE_TOKENS=32768
+# RDNA3 crossover is ~16 rows (GEMV ~56 tok/s vs reconstruct ~700 for chat-size
+# prefills); 144 is the NVIDIA-tuned default and would put 17..144-row prefills on
+# the decode path (+0.5-1.5 s TTFT). Override to restore the upstream default.
+ENV EXL3_RECONSTRUCT_THRESHOLD=16
 ENV PORT=9001
 EXPOSE 9001
 CMD ["python3", "/opt/exllamav3/serve_rocm.py"]
