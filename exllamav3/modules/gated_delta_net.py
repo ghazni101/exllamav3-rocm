@@ -26,6 +26,10 @@ from ..cache.recurrent import (
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+# Decode only. Attention MAX_QLEN is 16; using it here captures a HIP graph per
+# unique short-prefill length (2..16) and stalls TTFT on tiny prompts. Generator
+# max_q_size is 8; anything longer is prefill and should take the torch/chunk path.
+_GDN_BC_MAX_QLEN = int(os.environ.get("EXL3_GDN_BC_MAX_QLEN", "8"))
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
@@ -278,10 +282,16 @@ class GDNLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
-        )
+        # Pinned dst + non_blocking copy: a pageable .cpu() blocks the host until
+        # every enqueued op drains (~10 ms+ mid-prefill). The caching host
+        # allocator records a stream event on free(), so the buffer can't be
+        # recycled before the copy lands, and unstash() re-uploads on the same
+        # stream where ordering is already guaranteed.
+        s = torch.empty_like(self.recurrent_state[slot, :1], device = "cpu", pin_memory = True)
+        c = torch.empty_like(self.conv_state[slot, :, :cdim], device = "cpu", pin_memory = True)
+        s.copy_(self.recurrent_state[slot, :1], non_blocking = True)
+        c.copy_(self.conv_state[slot, :, :cdim], non_blocking = True)
+        return s, c
 
 
     def unstash(self, slot, stashed, position: int = 0):
@@ -1017,13 +1027,13 @@ class GatedDeltaNet(Module):
             self.ba_weight_filled = True
 
         # Fused C++ path for decode with split projections, generalized over (bsz, seqlen) up to
-        # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
+        # (_BC_MAX_BSZ, _GDN_BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
         # history) shape from the third invocation of that shape on
         if (
             self.bc_split and save_state and
             recurrent_slots is not None and
-            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _GDN_BC_MAX_QLEN
         ):
             if self.bc.needs_configure(bsz, seqlen, save_history):
                 if self.kda:

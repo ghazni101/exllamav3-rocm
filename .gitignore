@@ -22,3 +22,12 @@ exllamav3/exllamav3_ext/**/hip_*.h
 # regenerable profiling artifacts (harness README: do not commit)
 profiling/out_exec5/
 profiling/out_a/
+# more regenerable profiling outputs (tracked only: out_a)
+profiling/out_b/
+profiling/out_ctr_probe/
+profiling/out_guided/
+profiling/out_sg/
+
+# compiled profiling probe binaries
+profiling/buffer_load_probe
+profiling/dpp_xmask_probe

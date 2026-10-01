@@ -224,10 +224,13 @@ class SWALayerState:
     def stash(self, slot, position):
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
-        return (
-            self.k_state[slot, a:b].cpu(),
-            self.v_state[slot, a:b].cpu()
-        )
+        # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
+        # stalls the host mid-prefill.
+        k = torch.empty_like(self.k_state[slot, a:b], device = "cpu", pin_memory = True)
+        v = torch.empty_like(self.v_state[slot, a:b], device = "cpu", pin_memory = True)
+        k.copy_(self.k_state[slot, a:b], non_blocking = True)
+        v.copy_(self.v_state[slot, a:b], non_blocking = True)
+        return k, v
 
 
     def unstash(self, slot, stashed, position):

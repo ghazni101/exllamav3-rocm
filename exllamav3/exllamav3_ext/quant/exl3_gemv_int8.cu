@@ -13,6 +13,7 @@
 #include <cooperative_groups.h>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 
 
@@ -93,6 +94,41 @@ static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
     return nullptr;
 }
 
+static bool exl3_sq_stream_b()
+{
+    // K=4 wide-unit trellis loads (SLC+DLC via __builtin_nontemporal_load).
+    // Read once: the choice is a different kernel, and captured graphs must
+    // keep the pointer they recorded. gfx1100 4096/256: 35.36 vs DPP-only
+    // 35.40 (noise); default off. Only sq encodings get slc dlc (msq saddr
+    // drops the hint).
+    static const bool v = []
+    {
+        const char* e = getenv("EXL3_SQ_STREAM");
+        bool on = e && atoi(e) == 1;
+        if (on)
+            fprintf(stderr, "[sq-stream] K=4 trellis: builtin nontemporal (slc dlc), compiler-tracked wait\n");
+        return on;
+    }();
+    return v;
+}
+
+// 0 = global_load, 1 = nontemporal (EXL3_SQ_STREAM), 2 = buffer_load (ISA §9).
+// BUFFER_LOAD wins if both env vars are set. Read once (captured graphs).
+static int exl3_sq_load_k()
+{
+    static const int v = []
+    {
+        const char* b = getenv("EXL3_SQ_BUFFER_LOAD");
+        if (b && atoi(b) == 1)
+        {
+            fprintf(stderr, "[sq-buffer] K=4 trellis: BUFFER_LOAD_B64 (texture L0, V# rsrc)\n");
+            return 2;
+        }
+        return exl3_sq_stream_b() ? 1 : 0;
+    }();
+    return v;
+}
+
 static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual)
 {
     switch (K)
@@ -100,7 +136,7 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
         case 1: return exl3_gemv_int8_sq_sel_k1(M, c_fp32, residual);
         case 2: return exl3_gemv_int8_sq_sel_k2(M, c_fp32, residual);
         case 3: return exl3_gemv_int8_sq_sel_k3(M, c_fp32, residual);
-        case 4: return exl3_gemv_int8_sq_sel_k4(M, c_fp32, residual);
+        case 4: return exl3_gemv_int8_sq_sel_k4(M, c_fp32, residual, exl3_sq_load_k());
         case 5: return exl3_gemv_int8_sq_sel_k5(M, c_fp32, residual);
         case 6: return exl3_gemv_int8_sq_sel_k6(M, c_fp32, residual);
     }
@@ -114,7 +150,7 @@ static void* select_gemv_int8_msq_kernel(int K, bool c_fp32, bool residual)
         case 1: return exl3_gemv_int8_msq_sel_k1(c_fp32, residual);
         case 2: return exl3_gemv_int8_msq_sel_k2(c_fp32, residual);
         case 3: return exl3_gemv_int8_msq_sel_k3(c_fp32, residual);
-        case 4: return exl3_gemv_int8_msq_sel_k4(c_fp32, residual);
+        case 4: return exl3_gemv_int8_msq_sel_k4(c_fp32, residual, exl3_sq_load_k());
         case 5: return exl3_gemv_int8_msq_sel_k5(c_fp32, residual);
         case 6: return exl3_gemv_int8_msq_sel_k6(c_fp32, residual);
         case 7: return exl3_gemv_int8_msq_sel_k7(c_fp32, residual);
@@ -158,17 +194,63 @@ static int exl3_sq_stage_arg()
     return v > 3 ? 3 : v;       // 0 = off, 1 = stage all K, 2 = stage K4, 3 = K4 narrow
 }
 
-// EXL3_SQ_GRID_MULT scales the occupancy-derived sq/msq grid (1 = default, cap 8). Used with the
-// raised 2048 block cap so wide tensors can keep more tiles in flight without a rebuild.
+// EXL3_SQ_GRID_MULT scales the occupancy-derived sq/msq grid (cap 8).
+// WGP: MULT=2 is 35.12 vs 35.67 (miss). CU-mode: sms still 48, MULT=1 is 33.88
+// (underfill); MULT=2 is 38.36 vs xmask 35.67 (+7.6%), greedy-identical.
+// Hadamard keep (maxb=4): MULT=3 is 38.86 vs 41.30 (−5.9%, grid=576).
+// Default 2 only when compiled with -DEXL3_CUMODE.
 static int exl3_sq_grid_mult()
 {
     static const int v = []
     {
         const char* e = getenv("EXL3_SQ_GRID_MULT");
+#if defined(EXL3_CUMODE)
+        int n = e ? atoi(e) : 2;
+#else
         int n = e ? atoi(e) : 1;
+#endif
         return n < 1 ? 1 : (n > 8 ? 8 : n);
     }();
     return v;
+}
+
+
+// EXL3_SQ_ROWS_PER pins the K-slice height (multiple of 8). WGP default 32
+// (32.69 vs 48 at 32.00 on this model, pre-CU). CU-mode + MULT=2 + xor-16:
+// 40 is 40.79 vs 48 at 40.59 (+0.5%), greedy-identical. 56/64 miss. Hadamard
+// had_xmask on rows=40 is 41.30 (maxb 3→4). 48 at maxb=4 is 40.89 (−1.0%).
+// Default 40 only with -DEXL3_CUMODE.
+static int exl3_sq_rows_per_arg()
+{
+    static const int v = []
+    {
+        const char* e = getenv("EXL3_SQ_ROWS_PER");
+        int n = e ? atoi(e) : 0;
+        if (n > 0) return MAX((n + 7) & ~7, SQ_MINROWS);
+#if defined(USE_ROCM)
+#if defined(EXL3_CUMODE)
+        return 40;
+#else
+        return 32;
+#endif
+#else
+        return 0;
+#endif
+    }();
+    return v;
+}
+
+// EXL3_SQ_LAUNCH_LOG=N prints the first N sq/msq launches (grid/maxb/sms).
+// CU-mode A/B: WGP miss on MULT=2 means 1 block/WGP; CU + MULT=1 would fill
+// only 48 of 96 CUs if num_sms stays at the WGP count.
+static void sq_launch_log(const char* tag, int grid, int maxb, int num_sms,
+                          int ksplit, int rows_per, int size_k, int size_n)
+{
+    static int left = [] { const char* e = getenv("EXL3_SQ_LAUNCH_LOG"); return e ? atoi(e) : 0; }();
+    if (left <= 0) return;
+    fprintf(stderr, "[%s] grid=%d maxb=%d sms=%d ksplit=%d rows_per=%d k=%d n=%d\n",
+            tag, grid, maxb, num_sms, ksplit, rows_per, size_k, size_n);
+    --left;
 }
 
 // m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
@@ -194,17 +276,10 @@ static bool exl3_gemv_int8_sq
     // gfx1100 re-sweep (2026-09-17, model tensors, cold rotation): 48 beats 64 by ~6% on the
     // K=3/4 sq kernels and +4.8% decode b1 / +4.2% b4 end-to-end on the 4.0bpw model, so 48 was
     // the ROCm default. Re-measured 2026-09-17 on Qwen3.8-27B-3.5bpw (4096/256, K6+narrow):
-    // rows_per=32 = 32.69 tok/s vs 48 = 32.00 (+2.2%), 24 = 31.31 (worse); 32 is the new default.
-    static const int rows_per_env = []
-    {
-        const char* e = getenv("EXL3_SQ_ROWS_PER");
-        return e ? atoi(e) : 0;
-    }();
-#if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 32) + 7) & ~7, SQ_MINROWS);
-#else
-    int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
-#endif
+    // rows_per=32 = 32.69 tok/s vs 48 = 32.00 (+2.2%), 24 = 31.31 (worse); 32 was the WGP
+    // default. CU-mode + MULT=2 + xor-16 (2026-09-23): 40 is 40.79 vs 48 at 40.59;
+    // default 40 under -DEXL3_CUMODE (exl3_sq_rows_per_arg).
+    int rows_per_arg = exl3_sq_rows_per_arg();
     // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
     // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
     // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
@@ -275,6 +350,7 @@ static bool exl3_gemv_int8_sq
     int grid = MIN(MAX(maxb, 1) * num_sms * exl3_sq_grid_mult(), 2048);
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
+    sq_launch_log("sq-launch", grid, maxb, num_sms, ksplit, rows_per, size_k, size_n);
     if (ksplit > SQ_KSPLIT_CAP) return false;
     if (size_n / 256 > SQ_COUNTERS_CAP) return false;
 
@@ -366,16 +442,7 @@ bool exl3_gemv_int8_msq
 
     // Mirror of the kernel's work decomposition (sq's single-wave rule over the max width);
     // EXL3_SQ_ROWS_PER pins the slice height (ROCm default 32 — see sq path comment above)
-    static const int rows_per_env = []
-    {
-        const char* e = getenv("EXL3_SQ_ROWS_PER");
-        return e ? atoi(e) : 0;
-    }();
-#if defined(USE_ROCM)
-    int rows_per_arg = MAX(((rows_per_env > 0 ? rows_per_env : 32) + 7) & ~7, SQ_MINROWS);
-#else
-    int rows_per_arg = rows_per_env > 0 ? MAX((rows_per_env + 7) & ~7, SQ_MINROWS) : 0;
-#endif
+    int rows_per_arg = exl3_sq_rows_per_arg();
     // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
     // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
     // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
@@ -433,6 +500,7 @@ bool exl3_gemv_int8_msq
     int grid = MIN(MAX(maxb, 1) * num_sms * exl3_sq_grid_mult(), 2048);
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
+    sq_launch_log("msq-launch", grid, maxb, num_sms, ksplit, rows_per, size_k, size_n);
 
     // Workspace: counters share the sq prefix [0..SQ_COUNTERS_CAP); qsums/partials live beyond
     // SQ_WS_RESERVED like the coop kernels. If it doesn't fit, grow rows_per (fewer slices ->

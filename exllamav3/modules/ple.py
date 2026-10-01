@@ -101,7 +101,13 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
+        # stalls the host mid-prefill.
+        c = torch.empty_like(self.conv_state[slot, :, :self.win], device = "cpu", pin_memory = True)
+        i = torch.empty_like(self.id_state[slot, :self.ctx], device = "cpu", pin_memory = True)
+        c.copy_(self.conv_state[slot, :, :self.win], non_blocking = True)
+        i.copy_(self.id_state[slot, :self.ctx], non_blocking = True)
+        return c, i
 
     def unstash(self, slot, stashed, position: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])

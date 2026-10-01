@@ -10,10 +10,21 @@
 // is a warp-level one. Lane-level rates are 32x the wave32 numbers.
 //
 //   MODE 0  pure dp4a, ILP independent accumulator chains          -> dp4a issue ceiling
-//   MODE 1  one IMAD (x * 0x83DCD12D) per dp4a                     -> the wide unit's codebook mix
+//   MODE 1  one IMAD (x * 0x83DCD12D) per dp4a                     -> 32-bit codebook mix
 //   MODE 2  per 8 dp4a: one LDS.128 + 8 IMAD (operands from the load, so nothing hoists)
 //   MODE 3  pure v_fma_f32 chains   -> calibrates the issue ceiling itself (this part's measured
 //   MODE 4  pure v_add_nc_u32 chains   issue rate is what the "% of issue" column is relative to)
+//   MODE 5  16-bit window * 0x83DCD12D (v_mul_lo_u32) + dp4a       -> GEMV-true mix
+//   MODE 6  16-bit window via 24-bit split + dp4a                  -> ISA §V_MUL_LO_U32 note
+//   MODE 7  16-bit window * 0x83DCD12D only                        -> mul_lo throughput
+//   MODE 8  16-bit window 24-bit split only                        -> 2x u24 + lshl_add
+//
+// The 24-bit split is bit-identical for w in [0, 65535]:
+//   w * 0x83DCD12D == mul_u32_u24(w, 0xDCD12D) + (mul_u32_u24(w, 0x83) << 24)
+// ISA: V_MUL_U32_U24 is "as efficient as basic single-precision opcodes"; V_MUL_LO_U32
+// says to prefer it for small magnitudes. gfx1100 2026-09-23: C-level umul24
+// recombines to v_mul_lo_u32; forced-asm MODE 6 is 43 G vs MODE 5 64 G at ILP 8.
+// Three full-rate ops lose. Leave the GEMV hash as v_mul_lo_u32.
 //
 // ILP is the number of independent chains per thread (1/2/4/8); wave32 and wave64 are separate
 // builds (`-mwavefrontsize64`; wave32 is the default for gfx11 and the flag is rejected there).
@@ -40,6 +51,18 @@
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
     return __builtin_amdgcn_sudot4(true, a, false, b, c, false);
+}
+
+// 16-bit w * 0x83DCD12D via 24-bit muls (ISA V_MUL_U32_U24 + V_LSHL_ADD_U32).
+// HIP __umul24 / (hi<<24)+lo is bit-identical but LLVM recombines it back into
+// v_mul_lo_u32 (the exactness kernel collapsed to s_endpgm). Force the opcodes.
+__device__ __forceinline__ uint32_t hash24_mul1(uint32_t w)
+{
+    uint32_t lo, hi, out;
+    asm volatile("v_mul_u32_u24 %0, %1, 0x00dcd12d" : "=v"(lo) : "v"(w));
+    asm volatile("v_mul_u32_u24 %0, %1, 0x83" : "=v"(hi) : "v"(w));
+    asm volatile("v_lshl_add_u32 %0, %1, 24, %2" : "=v"(out) : "v"(hi), "v"(lo));
+    return out;
 }
 
 template <int ILP, int MODE>
@@ -95,6 +118,25 @@ void k_dp4a(const uint32_t* __restrict__ src, int iters, int* __restrict__ sink)
             #pragma unroll
             for (int i = 0; i < ILP; ++i) a[i] += b;      // v_add_nc_u32 chain
         }
+        else if (MODE == 5 || MODE == 6)
+        {
+            #pragma unroll
+            for (int i = 0; i < ILP; ++i)
+            {
+                uint32_t w = (a[i] + (uint32_t) it) & 0xffffu;
+                uint32_t h = (MODE == 6) ? hash24_mul1(w) : (w * mul);
+                acc[i] = dp4a_us(h, b, acc[i]);
+            }
+        }
+        else if (MODE == 7 || MODE == 8)
+        {
+            #pragma unroll
+            for (int i = 0; i < ILP; ++i)
+            {
+                uint32_t w = (a[i] + (uint32_t) it) & 0xffffu;
+                a[i] = (MODE == 8) ? hash24_mul1(w) : (w * mul);
+            }
+        }
         else
         {
             #pragma unroll
@@ -138,6 +180,15 @@ void k_dp4a_shfl(const uint32_t* __restrict__ src, int iters, int* __restrict__ 
         }
     }
     if (acc0 + acc1 == 0x7abcdef) sink[threadIdx.x] = acc0;
+}
+
+__global__ void k_hash24_exact(unsigned long long* mismatches)
+{
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= 65536u) return;
+    uint32_t ref = w * 0x83DCD12Du;
+    uint32_t got = hash24_mul1(w);
+    if (got != ref) atomicAdd(mismatches, 1ull);
 }
 
 template <int ILP, int MODE>
@@ -194,6 +245,25 @@ int main(int argc, char** argv)
     hipMalloc(&d_sink, sizeof(int) * THREADS);
     hipMemcpy(d_src, h.data(), sizeof(uint32_t) * 256, hipMemcpyHostToDevice);
 
+    unsigned long long host_mis = 0;
+    for (uint32_t w = 0; w < 65536u; ++w)
+    {
+        uint32_t lo = w * 0x00DCD12Du;
+        uint32_t hi = w * 0x83u;
+        uint32_t got = (hi << 24) + lo;
+        if (got != w * 0x83DCD12Du) ++host_mis;
+    }
+    printf("hash24 host exactness (0..65535): %llu mismatches\n", host_mis);
+
+    unsigned long long* d_mis; unsigned long long h_mis = 0;
+    hipMalloc(&d_mis, sizeof(unsigned long long));
+    hipMemset(d_mis, 0, sizeof(unsigned long long));
+    k_hash24_exact<<<256, 256>>>(d_mis);
+    hipMemcpy(&h_mis, d_mis, sizeof(unsigned long long), hipMemcpyDeviceToHost);
+    printf("hash24 exactness (0..65535 vs w*0x83DCD12D): %llu mismatches\n",
+           (unsigned long long) h_mis);
+    hipFree(d_mis);
+
     const double warps = (double) grid * THREADS / prop.warpSize;
     const double issue = ncu * 4.0 * clk;      // 4 SIMD/CU x clock = warp-instructions/s ceiling
     printf("%-5s %-4s %-10s %9s %12s %12s %10s\n",
@@ -202,9 +272,13 @@ int main(int argc, char** argv)
     {                                                                                       \
         double ms = run_kernel<ILP, MODE>(d_src, d_sink, grid, iters, reps);                \
         double nd = warps * (double) ILP * iters * reps;                                     \
-        double ni = nd * (MODE == 0 ? 1.0 : (MODE == 1 ? 2.0 :                                 \
-                      (MODE == 2 ? 1.0 + 1.0 / ILP + 0.25 : 1.0)));                          \
-        printf("%-5d %-4d %-10s %9.3f %12.1f %12.1f %9.1f%%\n", MODE, ILP, "dp4a", ms,      \
+        double inst_per = (MODE == 0 ? 1.0 : (MODE == 1 ? 2.0 :                               \
+                      (MODE == 2 ? 1.0 + 1.0 / ILP + 0.25 :                                    \
+                      (MODE == 5 ? 3.0 : (MODE == 6 ? 5.0 :                                    \
+                      (MODE == 7 ? 2.0 : (MODE == 8 ? 4.0 : 1.0)))))));                        \
+        double ni = nd * inst_per;                                                             \
+        const char* tag = (MODE == 7 || MODE == 8) ? "mul" : "dp4a";                           \
+        printf("%-5d %-4d %-10s %9.3f %12.1f %12.1f %9.1f%%\n", MODE, ILP, tag, ms,          \
                nd / (ms * 1e6), ni / (ms * 1e6), 100.0 * ni / (ms * 1e-3) / issue);         \
     }
     CASE(1, 0); CASE(2, 0); CASE(4, 0); CASE(8, 0);
@@ -212,6 +286,9 @@ int main(int argc, char** argv)
     CASE(4, 2); CASE(8, 2);
     CASE(2, 3); CASE(4, 3); CASE(8, 3); CASE(16, 3);
     CASE(4, 4); CASE(8, 4); CASE(16, 0); CASE(16, 1);
+    CASE(1, 5); CASE(2, 5); CASE(4, 5); CASE(8, 5);
+    CASE(1, 6); CASE(2, 6); CASE(4, 6); CASE(8, 6);
+    CASE(4, 7); CASE(8, 7); CASE(4, 8); CASE(8, 8);
     #define CASES(ILP)                                                                      \
     {                                                                                       \
         double ms = run_shfl<ILP>(d_src, d_sink, grid, iters, reps);                        \
@@ -223,5 +300,5 @@ int main(int argc, char** argv)
     printf("issue ceiling (4 SIMD/CU x %d CU x %.3f GHz): %.1f G warp-inst/s  "
            "[wave-%d; multiply lane rates by %d]\n", ncu, clk / 1e9, issue / 1e9,
            prop.warpSize, prop.warpSize);
-    return 0;
-}
+
+[Showing lines 1-300 of 303. Use :301 to continue]

@@ -152,17 +152,32 @@ class Embedding(Module):
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
             # When the embedding resides on the CPU, its output is uploaded to the first
-            # device layer; staging it through a reused pinned buffer makes that upload
-            # asynchronous. Only callers that guarantee a sync point between forward passes
-            # (the generator's decode loop) may set the pinned_staging flag.
+            # device layer; staging it through a pinned buffer makes that upload
+            # asynchronous. Prefill callers may enqueue back-to-back chunks without a
+            # sync, so each buffer pair alternates and the writer waits on the event
+            # recorded after its previous upload was submitted.
             if params.get("pinned_staging") and x.device.type == "cpu":
                 key = (x.shape, x.dtype)
-                buf = self._pinned_staging.get(key)
-                if buf is None:
+                entry = self._pinned_staging.get(key)
+                if entry is None:
                     if len(self._pinned_staging) > 8:
                         self._pinned_staging.clear()
-                    buf = torch.empty_like(x, pin_memory = True)
-                    self._pinned_staging[key] = buf
+                    # (two pinned buffers, two events, index of the last-used
+                    # buffer, whether that use still needs its event recorded)
+                    entry = [torch.empty_like(x, pin_memory = True),
+                             torch.empty_like(x, pin_memory = True),
+                             torch.cuda.Event(), torch.cuda.Event(), 0, False]
+                    self._pinned_staging[key] = entry
+                # Record the event for the buffer used on the previous call: its
+                # H2D upload was enqueued on this stream since then, so this
+                # event completes only after that copy has been read out.
+                if entry[5]:
+                    entry[2 + entry[4]].record(torch.cuda.current_stream())
+                i = entry[4] ^ 1
+                entry[4] = i
+                entry[5] = True
+                buf, ev = entry[i], entry[2 + i]
+                ev.synchronize()
                 buf.copy_(x)
                 x = buf
             return x

@@ -1,11 +1,15 @@
-import importlib.util
 import os
 
 from setuptools import setup
 
-if torch := importlib.util.find_spec("torch") is not None:
-    from torch.utils import cpp_extension
+try:
     from torch import version as torch_version
+    from torch.utils import cpp_extension
+except ImportError:
+    torch_version = None
+    cpp_extension = None
+
+torch = torch_version is not None
 
 extension_name = "exllamav3_ext"
 precompile = "EXLLAMA_NOCOMPILE" not in os.environ
@@ -19,7 +23,7 @@ if precompile and not torch:
 windows = os.name == "nt"
 
 extra_cflags = []
-is_hip = bool(torch and torch_version.hip)
+is_hip = bool(torch_version is not None and torch_version.hip)
 if is_hip:
     # hipcc is clang-based; nvcc-only flags (-Xcudafe, --use_fast_math, -lineinfo) are not
     # accepted. -ffast-math is the closest equivalent of --use_fast_math. gfx10/gfx11
@@ -29,6 +33,16 @@ if is_hip:
         # Opt-in hardware WMMA for the paired m16n16k16 MMA on gfx11. Off by
         # default: the path has a known NaN bug on M>=3 GEMM shapes.
         extra_cuda_cflags += ["-DEXL3_WMMA"]
+    if os.environ.get("EXL3_CUMODE") == "1":
+        # gfx11 default is WGP (2 CUs). CU mode schedules each 256-thread GEMV
+        # block on one CU, doubling the number of independent workgroup slots
+        # (48 WGPs → 96 CUs). Measured: CU+MULT=2 = 38.36 vs WGP 35.67.
+        extra_cuda_cflags += ["-mcumode", "-DEXL3_CUMODE"]
+        # gfx1100 4096/256: CU + MULT=2 is 38.36 vs WGP 35.67. Pair with
+        # default MULT=2 under -DEXL3_CUMODE (exl3_gemv_int8.cu).
+        # hipcc also reads HIPCC_FLAGS; ninja does not echo argv so the
+        # Dockerfile cannot grep the compiler command line.
+        os.environ["HIPCC_FLAGS"] = (os.environ.get("HIPCC_FLAGS", "") + " -mcumode").strip()
 else:
     extra_cuda_cflags = [
         "-lineinfo", "-O3", "--use_fast_math",
@@ -61,6 +75,19 @@ extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
 }
+if is_hip:
+    extra_compile_args["hipcc"] = extra_cuda_cflags
+    extra_compile_args["hip"] = extra_cuda_cflags
+# pip's pyproject backend swallows setup.py stdout, so the Dockerfile cannot
+# grep the print. Stamp a file in the same RUN layer instead.
+_flag_line = "EXL3_HIP_CFLAGS: %s is_hip=%s EXL3_CUMODE=%s\n" % (
+    extra_cuda_cflags, is_hip, os.environ.get("EXL3_CUMODE"))
+try:
+    with open("/tmp/exl3_hip_cflags.txt", "w") as _hf:
+        _hf.write(_flag_line)
+except OSError:
+    pass
+print(_flag_line, end="", flush=True)
 
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
@@ -75,8 +102,9 @@ sources = [
     and '_hip.' not in file and not file.startswith('hip_')
 ]
 
-setup_kwargs = (
-    {
+setup_kwargs = {}
+if precompile and cpp_extension is not None:
+    setup_kwargs = {
         "ext_modules": [
             cpp_extension.CUDAExtension(
                 extension_name,
@@ -92,9 +120,6 @@ setup_kwargs = (
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},
     }
-    if precompile and torch
-    else {}
-)
 
 setup(
     verbose=verbose,

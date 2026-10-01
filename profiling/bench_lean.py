@@ -55,8 +55,16 @@ def main():
     ids = base
     while ids.shape[1] < 2048:
         ids = torch.cat([ids, chunk], dim=1)
-    nonce = tok.encode("".join(random.choices(string.ascii_letters, k=24)), add_bos=False)
-    p = torch.cat([nonce, ids[:, :2048]], dim=1)
+    # Interleave a nonce through the prompt so no 256-token page can prefix-hit:
+    # a head nonce only poisons the first page and the repeated filler body hits
+    # every remaining page (HY-2 in the findings log).
+    # Unique poison every 96 positions: guarantees no two 256-token pages
+    # hash alike, so prefix caching can't contaminate the cold measurement.
+    import random as _r
+    _r.seed(1234)
+    p = ids[:, :2048].clone()
+    for k in range(0, 2048, 96):
+        p[0, k] = _r.randrange(100000, 150000)
     r = run(gen, p, 4)
     out["prefill_2k_tps"] = round(p.shape[1] / r["time_prefill"], 1)
 

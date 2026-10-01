@@ -185,7 +185,11 @@ class ShortConvLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return self.conv_state[slot, :, :cdim].cpu()
+        # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
+        # stalls the host mid-prefill.
+        c = torch.empty_like(self.conv_state[slot, :, :cdim], device = "cpu", pin_memory = True)
+        c.copy_(self.conv_state[slot, :, :cdim], non_blocking = True)
+        return c
 
 
     def unstash(self, slot, stashed, position: int = 0):

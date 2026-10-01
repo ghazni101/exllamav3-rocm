@@ -4,10 +4,15 @@ from pydantic import BaseModel
 import uvicorn
 
 from exllamav3 import Model, Config, Cache, Tokenizer, Generator, Job
+from exllamav3.cache import CacheLayer_quant
+from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.sampler import GreedySampler, CategoricalSampler
 
 MODEL_DIR = os.environ.get("EXL3_MODEL", "/models/qwen38-27b")
 MAX_TOKENS = int(os.environ.get("EXL3_CACHE_TOKENS", "32768"))
+if MAX_TOKENS % PAGE_SIZE:
+    MAX_TOKENS += PAGE_SIZE - (MAX_TOKENS % PAGE_SIZE)
+KV_BITS = os.environ.get("EXL3_KV_BITS")
 MAX_BATCH = int(os.environ.get("EXL3_MAX_BATCH", "16"))
 
 app = FastAPI()
@@ -67,7 +72,14 @@ def load_model():
     t0 = time.time()
     config = Config.from_directory(MODEL_DIR)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=MAX_TOKENS)
+    if KV_BITS:
+        bits = int(KV_BITS)
+        cache = Cache(model, max_num_tokens=MAX_TOKENS,
+                      layer_type=CacheLayer_quant, k_bits=bits, v_bits=bits)
+        print(f"[serve] cache Q{bits} max_num_tokens={MAX_TOKENS} page={PAGE_SIZE}", flush=True)
+    else:
+        cache = Cache(model, max_num_tokens=MAX_TOKENS)
+        print(f"[serve] cache fp16 max_num_tokens={MAX_TOKENS} page={PAGE_SIZE}", flush=True)
     model.load(device="cuda:0")
     tokenizer = Tokenizer.from_config(config)
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer,

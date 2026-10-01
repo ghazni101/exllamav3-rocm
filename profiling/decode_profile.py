@@ -65,10 +65,22 @@ ref_tps = r["new_tokens"] / r["time_generate"]
 print(f"reference: {ref_tps:.2f} tok/s over {r['new_tokens']} tokens "
       f"({r['time_generate'] / r['new_tokens'] * 1e3:.2f} ms/token)", flush=True)
 
-# Profiled window: a second run on a fresh nonce so no prefix-cache hit
+# Profiled window: a second run on a fresh nonce so no prefix-cache hit.
+# Drain prefill (and the iterate that emits the first streaming token) BEFORE
+# starting the profiler so hipBLAS/reconstruct/exl3_gemm are not mixed into
+# the decode attribution. CTX=4096 prefill was 40% of the previous capture.
 prompt2 = torch.cat([tok.encode(nonce(), add_bos=False), ids[:, :max(CTX, 1)]], dim=1)
 job = Job(input_ids=prompt2, max_new_tokens=N, sampler=GreedySampler())
 gen.enqueue(job)
+prefill_iters = 0
+while True:
+    rs = gen.iterate()
+    prefill_iters += 1
+    if any(r_.get("eos") for r_ in rs):
+        raise RuntimeError("job finished during prefill drain")
+    if any(r_.get("stage") == "streaming" for r_ in rs):
+        break
+print(f"prefill drain iters={prefill_iters} (first streaming token excluded)", flush=True)
 t0 = time.time()
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
     while True:

@@ -830,3 +830,751 @@ structural: graph-capturing the whole decode step (gap 4.4 -> ~1 ms), fusing the
 rms_norm and GDN micro-chain (~1 ms device + ~300 launches), and a fundamentally different
 weight-streaming scheme for the small-n shapes (n=5120 down/o family at half the bandwidth of
 the same-size wide-n matrices, no configuration sensitivity found).
+
+## 15. Session ISA (2026-09-23): DPP rotate is a keep; streaming loads are not
+
+Image `exllamav3-rocm:goal-isa` (Dockerfile.goal, INSTALL_VERIFIED, `bc_attn` False).
+Harness `profiling/guided_tg.py` 4096/256 b1 greedy vs `final-b2-a.json` tokens.
+Two always-on / env-gated ISA changes in the K=4 wide unit, from the RDNA3 ISA
+(Feb 2023 / 15-Aug-2023):
+
+1. **Hot-loop shuffle → DPP16 `ROW_RR:1`** (`__builtin_amdgcn_update_dpp` dpp_ctrl
+   0x121, ISA §7.7.1). Always on for ROCm. 256-thread GPU check: 0 mismatches vs
+   `__shfl_sync`. ISA of the installed ext: 1 `v_mov_b32_dpp row_ror:1` in sq K=4
+   M=1, 2 in msq K=4; the remaining `ds_bpermute` (83 / 134) are the xor reductions
+   and Hadamard butterflies, not this permute.
+2. **`EXL3_SQ_STREAM=1`**: `__builtin_nontemporal_load` of an `ext_vector_type(2)`
+   (HIP `uint2` is a struct). sq encodings emit 3× `global_load_b64 … slc dlc`
+   (ISA §4.1.1); msq uses saddr (`global_load_b64 v[..], vN, s[..]`) and LLVM
+   drops the hint — msq_plain and msq_stream encodings are identical. Consume
+   still waits `vmcnt(0)` (17 in sq, 28 in msq) because `r0=r1; r1=r2` reuse
+   those VGPRs. Occupancy unchanged (max v[71] sq / v[56] msq, under the 96-VGPR
+   16-wave/SIMD line).
+
+| arm | median tok/s | runs | token_parity vs b2 |
+|---|---|---|---|
+| goal-b2 (`b2-def.json`) | 34.74 | 34.82 / 34.74 / 34.66 | (baseline) |
+| final-b2-a | 34.61 | 34.66 / 34.61 / 34.59 | true |
+| **goal-isa DPP-only** (`isa-dpp.json`) | **35.40** | 35.49 / 35.40 / 35.31 | **true** |
+| goal-isa + `EXL3_SQ_STREAM=1` (`isa-stream.json`) | 35.36 | 35.48 / 35.36 / 35.32 | true |
+
+DPP is +1.9% vs b2-def, +2.3% vs final-b2-a, greedy-identical. Stream is noise
+on top of DPP and does not land on msq (5.7 ms of the 22.7 ms GEMV block).
+**Keep DPP; leave `EXL3_SQ_STREAM` default off.** VOPD still does not cover
+`v_dot4` / `v_mul_lo_u32` / `v_bfe`. Hash multiply (next) is a miss: see §16.
+
+## 16. Session ISA (2026-09-23): 24-bit hash split is a miss
+
+sq K=4 M=1 has 49 `v_mul_lo_u32` vs 48 `v_dot4`. ISA §V_MUL_LO_U32: "to multiply
+integers with small magnitudes consider V_MUL_U32_U24, which is intended to be
+a more efficient implementation." The trellis window is 16-bit, so
+
+    w * 0x83DCD12D  ==  mul_u32_u24(w, 0xDCD12D) + (mul_u32_u24(w, 0x83) << 24)
+
+is bit-identical (host + GPU, 0 mismatches on 0..65535). LLVM recombines the
+C-level form (`__umul24` / `(hi<<24)+lo`) back into one `v_mul_lo_u32`; the
+opcodes only appear with inline asm (`profiling/dp4a_peak.hip` MODE 6/8).
+
+`dp4a_peak` on gfx1100, grid 384, 256 threads, 1024 iters × 20 reps, 2.482 GHz:
+
+| mode | mix | ILP 8 G warp-dp4a/s (or mul/s) |
+|---|---|---|
+| 0 | pure dp4a | 129.4 |
+| 1 | 32-bit `v_mul_lo_u32` + dp4a | 93.8 |
+| 5 | 16-bit window `v_mul_lo_u32` + dp4a (GEMV-true) | **63.5** |
+| 6 | 16-bit 2×`v_mul_u32_u24`+`v_lshl_add_u32` + dp4a | 43.4 |
+| 7 | 16-bit `v_mul_lo_u32` only | 86.2 |
+| 8 | 16-bit 24-split only | 67.2 |
+
+Three full-rate ops lose to one `v_mul_lo_u32` at the GEMV's ILP. ILP 1 is a
+tie (33.0 vs 32.3); ILP 4/8 (the consume_row shape) is −27%. **Leave the
+codebook hash as `w *= 0x83DCD12Du`.** Do not add the 24-bit split.
+
+The leftover `ds_bpermute` (xor tails) is a keep: see §18. Still open: CU vs
+WGP (`-mcumode`), `buffer_load` vs `global_load`. Not VOPD / v_dot8 / WMMA.
+Hadamard xor-16 still uses `ds_bpermute` (DPP ROW_XMASK only covers mask 1/2/4/8).
+
+## 17. Session ISA (2026-09-23): NARROWN=128 is a miss
+
+`EXL3_SQ_ROWS_PER_NARROWN=128` on `goal-isa` (DPP rotate already on), 4096/256 b1
+greedy vs `isa-dpp.json` tokens.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| DPP-only (`isa-dpp.json`) | **35.40** | 35.49 / 35.40 / 35.31 | (ref) |
+| NARROWN=128 (`isa-narrow128.json`) | 33.58 | 33.66 / 33.58 / 33.55 | true |
+
+−5.1% vs DPP. Taller slices on n<12288 raise per-unit occupancy cost more than they
+cut slice-count overhead. **Leave NARROWN off.** Global `EXL3_SQ_ROWS_PER` stays 32.
+
+The opposite (`NARROWN=16` = SQ_MINROWS) is not a legal A/B on this model: down_proj
+k=17408 → rows_total=1088 → ksplit=68, and `SQ_KSPLIT_CAP` is 64, so the sq path
+declines and the run dies (rc=1, no JSON, twice). Do not re-try 16 without raising
+the cap. Floor that still fits the cap is rows_per=32 (ksplit=34).
+
+## 18. Session ISA (2026-09-23): DPP ROW_XMASK on xor tails is a keep
+
+Image `exllamav3-rocm:goal-isa-xmask` (Dockerfile.goal, INSTALL_VERIFIED). Same
+harness vs `isa-dpp.json` tokens. `__shfl_xor_sync` in the int8 GEMV reductions
+and max-reduces now goes through `exl3_row_xmask` (DPP16 `ROW_XMASK`, dpp_ctrl
+0x160+mask). xor-16 stays on `ds_bpermute` (crosses the 16-lane group).
+
+Probe (`profiling/dpp_xmask_probe.hip`): 0 mismatches on xor-1/2/4/8; standalone
+xor-1 add 125.7 vs 30.7 G/s. First build died because the helpers sat below
+`gemv_int8_row_sums`; moved them above the device building-blocks section.
+
+ISA census vs goal-isa (K=4 M=1 residual-off):
+
+| kernel | row_ror | row_xmask (1/2/4/8) | ds_bpermute was → now |
+|---|---|---|---|
+| sq | 1 | 42 (16/14/6/6) | 83 → 45 |
+| msq | 2 | 52 (16/12/12/12) | 134 → 90 |
+
+| arm | median tok/s | runs | parity vs dpp |
+|---|---|---|---|
+| DPP-only (`isa-dpp.json`) | 35.40 | 35.49 / 35.40 / 35.31 | (ref) |
+| **xmask** (`isa-xmask.json`) | **35.67** | 35.78 / 35.67 / 35.62 | **true** |
+
++0.76% vs DPP, +2.7% vs b2 34.74. All three xmask runs sit above all three DPP
+runs. **Keep.** Combined ISA permutes: rotate + xor-DPP.
+
+NARROWN=16 on xmask died on SQ_KSPLIT_CAP (§17); do not retry.
+
+## 19. Session ISA (2026-09-23): GRID_MULT=2 is a miss
+
+Same xmask image, no rebuild. `EXL3_SQ_GRID_MULT=2` vs `isa-xmask.json` tokens.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| xmask default (`isa-xmask.json`) | **35.67** | 35.78 / 35.67 / 35.62 | (ref) |
+| GRID_MULT=2 (`isa-g2.json`) | 35.12 | 35.27 / 35.12 / 35.12 | true |
+
+-1.54%. All three G2 runs sit below all three xmask runs. Extra blocks queue:
+occupancy is already one 256-thread block per WGP (ROCm `num_sms`=48). Leave
+`EXL3_SQ_GRID_MULT=1`. Do not retry 4/8.
+
+Tiling knobs on this image are closed (NARROWN 128 miss, 16 illegal, GRID_MULT
+miss). Next: `-mcumode` rebuild (`EXL3_CUMODE=1`) so each CU hosts its own
+workgroup (48 WGPs → 96 CUs).
+
+## 20. Session ISA (2026-09-23): VOPD / packed / WMMA closed by the ISA; CU-mode + buffer_load open
+
+Read `rdna3-shader-instruction-set-architecture-feb-2023_0.md` against the K=4
+wide-unit inner loop (16 `v_mul_lo_u32` hash + 16 `v_dot4` + DPP rotate):
+
+- **VOPD (ISA §7.6 / §16.11)** is wave32 dual-issue, but X opcodes are F32
+  (`FMAC`/`MUL`/`ADD`/`DOT2ACC_F16`) and Y adds only `ADD_NC_U32` / `AND_B32` /
+  `LSHLREV_B32`. There is no dual `v_mul_lo_u32` or `v_dot4`. Do not emit VOPD
+  in this kernel.
+- **v_dot8** (`V_DOT8_I32_IU4`) is 8×4-bit. The codebook is 8-bit after the
+  0x83DCD12D hash. Wrong datatype.
+- **WMMA I32 16×16×16 IU8 (ISA §7.9)** needs 16 rows of A replicated across
+  lanes 0–15/16–31. Decode GEMV is M=1. Wrong shape.
+- **Packed 16-bit (ISA §7.5)** is F16/I16 pairs. Inner loop is I32 hash + I8
+  dp4a. No fit.
+- **CU vs WGP (ISA §12.1.2)**: `-mcumode` / `.workgroup_processor_mode=0x00`.
+  Image `goal-isa-cumode` rebuilding. Measure with `EXL3_SQ_GRID_MULT=2`
+  because ROCm still reports 48 SMs; MULT=1 would fill 48 of 96 CUs. Token
+  parity vs `isa-xmask.json`.
+- **buffer_load (ISA §9)**: texture-cache L0 vs `global_load` vector L0.
+  Wired as `EXL3_SQ_BUFFER_LOAD=1` (`load_k==2`) for the next A/B. Isolated
+  probe `profiling/buffer_load_probe.hip` must be 0-mismatch before e2e.
+- **DS_SWIZZLE SWAPX16 (ISA §16.15, offset 0x401f)** for remaining xor-16.
+  Not default-on until the same probe is 0-mismatch.
+
+
+Probe (`profiling/buffer_load_probe.hip`) on gfx1100:
+
+| check | result |
+|---|---|
+| BUFFER_LOAD_B64 vs global, flags `0x00020000` | 16384/16384 mismatch (format INVALID / dst_sel=0 → zeros; fake 5.5 TB/s) |
+| BUFFER_LOAD_B64 vs global, flags `0x31004000` (CK gfx11 V# word3) | **0 mismatches** |
+| DS_SWIZZLE SWAPX16 `0x401f` vs shfl_xor-16 | **0 mismatches** |
+| synthetic GB/s global vs buffer (`0x31004000`) | 2468 vs **4747** (+92%) |
+
+Re-run 14:04 UTC, probe rc=0. xor-16 swizzle is **not** default-on in the CU-mode
+image (kept `ds_bpermute` so that A/B is `-mcumode` only). `EXL3_SQ_BUFFER_LOAD=1`
+is the next one-variable e2e A/B after CU-mode, token parity vs xmask.
+
+CU-mode Docker false fail: pip's pyproject backend swallows setup.py stdout, so
+grepping pip.log for `-mcumode` killed a successful wheel. Stamp is now
+`/tmp/exl3_hip_cflags.txt`; ELF `.workgroup_processor_mode=0x00` is the gate.
+
+## 21. 50 tok/s budget (honest, 2026-09-23)
+
+Incumbent: `isa-had-r40.json` 4096/256 b1 greedy **41.30 tok/s** (41.39 / 41.30 / 41.19),
+parity green vs swizzle-r40 40.79. Goal is 50. That is **+21%**, ~24.21 → 20.0 ms/token.
+
+Decode-only recapture at this keep (`had-r40-dec`, prefill drained, 63 tokens):
+unprofiled ref **41.47 tok/s** = 24.11 ms/token. Device 1369 ms → **21.73
+ms/token**. Host idle **~2.38 ms**. GEMV **18.30 ms/token** (84% of device,
+76% of wall). Kernel averages are unchanged vs swizzle-r40-dec (18.29 ms);
+the +1.2% e2e is occupancy (`maxb` 3→4), not a shorter inner loop.
+
+Arithmetic to 50 from 41.30 (24.21 ms/token on 4096/256):
+
+| lever | max save if it went to zero | tok/s if only this |
+|---|---|---|
+| host idle 2.38 ms | 2.38 ms | ~45.8 |
+| attn+GDN+norm+act ~3.4 ms | 3.4 ms | ~48.0 |
+| remaining to 20.0 ms | 4.21 ms | **50** |
+
+Zeroing host does not reach 50. Zeroing non-GEMV device does not reach 50.
+**GEMV has to get ~24% faster** (18.30 → ~14.1 ms) if host and the rest stay.
+CU-mode occupancy wall: 256-thread blocks, 8 waves, 2 SIMD32 × 16 wave slots
+= **4 blocks/CU**. `maxb=4` is that ceiling. Cannot raise occupancy without
+shrinking the block.
+
+Closed ISA: VOPD, v_dot8, WMMA, packed 16, 24-bit hash, STREAM/nontemporal,
+NARROWN=128 (WGP) and NARROWN=64 (CU, −1.5%), GRID_MULT=2 on WGP, launch_bounds
+minBlocks, BUFFER_LOAD (−2.6%), CU MULT=3 at maxb=3 (−3.7%) and at maxb=4
+(−5.9%, grid=576 = 6/CU). Occupancy-shape 32/48/56/64. Closed keeps: CU
+MULT=2, xor-16 `DS_SWIZZLE`, rows_per=40, Hadamard `had_xmask` (+1.2% → 41.30,
+occupancy maxb 3→4). rows_per=36 rounds to 40; 41.18 ≈ 41.30. Closed miss: K=3
+independent BFE (−0.17%). Open: replace inner-loop v_mul_lo (LDS 2×256 LUT probe). Do not call
+50 done until a 4096/256 greedy median is measured ≥50 with token parity.
+
+## 22. Session ISA (2026-09-23): CU-mode image verified; 4096/256 A/B in flight
+
+`exllamav3-rocm:goal-isa-cumode` (Dockerfile.goal `EXL3_CUMODE=1`):
+
+- hip cflags stamp: `-O3 -ffast-math -DHIPBLAS_USE_HIP_HALF -mcumode`
+- `INSTALL_VERIFIED`
+- ELF `.workgroup_processor_mode`: `{'0x0': 1472}` verdict **CU** (`ELF_MODE_VERIFIED`)
+- xor-16 left on `ds_bpermute` so this A/B is `-mcumode` only
+
+xmask K=4 M=1 residual-off ISA (`profiling/out_guided/isa-xmask-dump`):
+
+| opcode | count |
+|---|---|
+| `v_dot4_i32_iu8` | 48 |
+| `v_mul_lo_u32` | 49 |
+| `v_mov_b32_dpp` | 43 |
+| `ds_bpermute_b32` | 45 |
+| `global_load_b64` | 7 |
+| `buffer_load_b64` | 0 |
+| `ds_swizzle_b32` | 0 |
+
+One consume_row body is ~190 insns: 16 mul + 16 dot + 3 `global_load_b64` + 2 `ds_load_b128`.
+VALU-bound. `BUFFER_LOAD` synthetic +92% GB/s is not the inner loop.
+
+4096/256 vs `isa-xmask.json` (35.67), token parity true both arms:
+
+| arm | median tok/s | runs | parity | launch (sq k=5120 n=17408) |
+|---|---|---|---|---|
+| xmask WGP (`isa-xmask.json`) | **35.67** | 35.78 / 35.67 / 35.62 | (ref) | (prior) |
+| CU MULT=1 (`isa-cumode.json`) | 33.88 | 33.98 / 33.88 / 33.84 | true | grid=144 maxb=3 sms=48 |
+| **CU MULT=2** (`isa-cumode-g2.json`) | **38.36** | 38.46 / 38.36 / 38.30 | **true** | grid=288 maxb=3 sms=48 |
+
+**Keep `-mcumode` + MULT=2.** MULT=1 underfills (sms stays 48). MULT=2 on WGP was a
+miss; the keep is the pair. New incumbent **38.36**, still not 50 (+30% remaining).
+Default MULT=2 under `-DEXL3_CUMODE` (swizzle rebuild). BUFFER_LOAD closed: 37.37
+vs 38.36 (−2.6%).
+
+## 23. Session ISA (2026-09-23): BUFFER_LOAD is a miss (−2.6%)
+
+`EXL3_SQ_BUFFER_LOAD=1 EXL3_SQ_GRID_MULT=2` on `goal-isa-cumode` vs
+`isa-cumode-g2.json` (38.36). First attempt: docker/python **SIGSEGV 139**,
+empty log (stdout not flushed; container-name clash). Retry with
+`PYTHONUNBUFFERED=1` completed.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| CU MULT=2 (`isa-cumode-g2.json`) | **38.36** | 38.46 / 38.36 / 38.30 | (ref) |
+| BUFFER_LOAD (`isa-buffer-g2.json`) | 37.37 | 37.52 / 37.37 / 37.20 | **true** |
+
+−2.6%. All three buffer runs sit below all three g2 runs. Isolated probe was
+0-mismatch / +92% synthetic GB/s; the inner loop is VALU-bound (`v_mul_lo` +
+`v_dot4`), so texture L0 does not help. **Leave `EXL3_SQ_BUFFER_LOAD=0`.**
+Do not retry.
+
+xor-16 `DS_SWIZZLE` image compiling.
+
+## 24. Session ISA (2026-09-23): CU MULT=3 is a miss (−3.7%)
+
+`EXL3_SQ_GRID_MULT=3` on `goal-isa-cumode` vs `isa-cumode-g2.json` (38.36).
+Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **CU MULT=2** (`isa-cumode-g2.json`) | **38.36** | 38.46 / 38.36 / 38.30 | (ref) | grid=288 maxb=3 sms=48 |
+| CU MULT=3 (`isa-cumode-g3.json`) | 36.93 | 37.21 / 36.93 / 36.91 | **true** | grid=432 maxb=3 sms=48 |
+
+−3.7%. 432 blocks = 4.5 per CU; occupancy is maxb=3 (3 per CU = 288). Same
+oversubscribe pattern as WGP MULT=2. **Keep MULT=2.** Do not raise the default.
+
+Incumbent was 38.36 until rows_per=48.
+
+## 25. Session ISA (2026-09-23): rows_per=48 is a keep (+4.5% → 40.08)
+
+`EXL3_SQ_ROWS_PER=48 EXL3_SQ_GRID_MULT=2` on `goal-isa-cumode` vs
+`isa-cumode-g2.json` (38.36). Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| CU MULT=2 rows=32 (`isa-cumode-g2.json`) | 38.36 | 38.46 / 38.36 / 38.30 | (ref) | grid=288 ksplit=10 |
+| **CU MULT=2 rows=48** (`isa-cumode-r48.json`) | **40.08** | 40.12 / 40.08 / 39.99 | **true** | grid=288 ksplit=7 |
+
++4.5%. Fewer K-splits, same 288-block grid. Pre-CU this model preferred 32
+(32.69 vs 48 at 32.00); CU-mode occupancy flipped it. **Default 48 under
+`-DEXL3_CUMODE`.** New incumbent **40.08**, still not 50 (−20%, 24.95 → 20.0
+ms/token). Next was xor-16.
+
+## 26. Session ISA (2026-09-23): xor-16 DS_SWIZZLE is a keep (+1.3% → 40.59)
+
+`goal-isa-swizzle` (`ds_swizzle` SWAPX16 0x401f) vs `goal-isa-cumode` (`ds_bpermute`)
+with `EXL3_SQ_GRID_MULT=2 EXL3_SQ_ROWS_PER=48`. Token parity true.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| CU MULT=2 rows=48 (`isa-cumode-r48.json`) | 40.08 | 40.12 / 40.08 / 39.99 | (ref) |
+| **+ xor-16 SWAPX16** (`isa-swizzle-r48.json`) | **40.59** | 40.64 / 40.59 / 40.53 | **true** |
+
++1.3%. No run overlap (min swizzle 40.53 > max r48 40.12). Keep `ds_swizzle` for
+xor-16. New incumbent **40.59**, still not 50 (−19%, 24.64 → 20.0 ms/token).
+Next was rows_per=64.
+
+## 27. Session ISA (2026-09-23): rows_per=64 is a miss (−3.3%)
+
+`EXL3_SQ_ROWS_PER=64` on `goal-isa-swizzle` vs `isa-swizzle-r48.json` (40.59).
+Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **rows=48** (`isa-swizzle-r48.json`) | **40.59** | 40.64 / 40.59 / 40.53 | (ref) | grid=288 ksplit=7 |
+| rows=64 (`isa-swizzle-r64.json`) | 39.26 | 39.34 / 39.26 / 39.13 | **true** | grid=288 ksplit=5 |
+
+−3.3%. Taller slices cut ksplit 7→5 but lose the occupancy that made 48 beat 32.
+**Keep 48.** Next was 56.
+
+## 28. Session ISA (2026-09-23): rows_per=56 is a miss (−2.3%)
+
+`EXL3_SQ_ROWS_PER=56` on `goal-isa-swizzle` vs `isa-swizzle-r48.json` (40.59).
+Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **rows=48** (`isa-swizzle-r48.json`) | **40.59** | 40.64 / 40.59 / 40.53 | (ref) | grid=288 ksplit=7 |
+| rows=56 (`isa-swizzle-r56.json`) | 39.64 | 39.77 / 39.64 / 39.58 | **true** | grid=288 ksplit=6 |
+| rows=64 (`isa-swizzle-r64.json`) | 39.26 | 39.34 / 39.26 / 39.13 | true | grid=288 ksplit=5 |
+
+−2.3% at 56, −3.3% at 64. Taller than 48 loses occupancy. Next was 40.
+
+## 29. Session ISA (2026-09-23): rows_per=40 is a keep (+0.5% → 40.79)
+
+`EXL3_SQ_ROWS_PER=40` on `goal-isa-swizzle` vs `isa-swizzle-r48.json` (40.59).
+Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| rows=48 (`isa-swizzle-r48.json`) | 40.59 | 40.64 / 40.59 / 40.53 | (ref) | grid=288 ksplit=7 |
+| **rows=40** (`isa-swizzle-r40.json`) | **40.79** | 40.87 / 40.79 / 40.74 | **true** | grid=288 ksplit=8 |
+| rows=56 | 39.64 | 39.77 / 39.64 / 39.58 | true | ksplit=6 |
+| rows=64 | 39.26 | 39.34 / 39.26 / 39.13 | true | ksplit=5 |
+
++0.5%. No run overlap (min 40 40.74 > max 48 40.64). ksplit 8 vs 7 is the
+occupancy sweet spot under CU+MULT=2. **Default 40 under `-DEXL3_CUMODE`.**
+New incumbent **40.79**, still not 50 (−18%, 24.52 → 20.0 ms/token). Next was
+CU NARROWN=64.
+
+## 30. Session ISA (2026-09-23): CU NARROWN=64 is a miss (−1.5%)
+
+`EXL3_SQ_ROWS_PER=40 EXL3_SQ_ROWS_PER_NARROWN=64` on `goal-isa-swizzle` vs
+`isa-swizzle-r40.json` (40.79). Env only, same image, token parity true.
+
+Launch log confirms the split: wide-n (`k=5120 n=17408`) stayed `rows_per=40`
+ksplit=8; narrow-n (`n=2048/5120`) went to `rows_per=64` ksplit=5/6/17.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| **rows=40 all** (`isa-swizzle-r40.json`) | **40.79** | 40.87 / 40.79 / 40.74 | (ref) |
+| NARROWN=64 (`isa-swizzle-r40-nn64.json`) | 40.16 | 40.24 / 40.16 / 40.10 | **true** |
+
+−1.5%. All three NARROWN runs sit below all three r40 runs. Taller slices lose
+occupancy even on down_proj / o_proj. **Leave `EXL3_SQ_ROWS_PER_NARROWN=0`.**
+Do not retry 128 or 56 here — global 56/64 already lost. Next was rows_per=32.
+
+## 31. Session ISA (2026-09-23): rows_per=32 on xor-16 is a miss (−4.5%)
+
+`EXL3_SQ_ROWS_PER=32` on `goal-isa-swizzle` vs `isa-swizzle-r40.json` (40.79).
+Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **rows=40** (`isa-swizzle-r40.json`) | **40.79** | 40.87 / 40.79 / 40.74 | (ref) | grid=288 ksplit=8 |
+| rows=48 | 40.59 | 40.64 / 40.59 / 40.53 | true | ksplit=7 |
+| rows=32 (`isa-swizzle-r32.json`) | 38.96 | 39.05 / 38.96 / 38.90 | **true** | grid=288 ksplit=10 |
+| rows=56 | 39.64 | 39.77 / 39.64 / 39.58 | true | ksplit=6 |
+| rows=64 | 39.26 | 39.34 / 39.26 / 39.13 | true | ksplit=5 |
+
+−4.5%. Unimodal: 32 < 40 > 48 > 56 > 64. CU-mode occupancy peak is 40
+(ksplit=8). Pre-CU this model preferred 32 (32.69 vs 48 at 32.00); xor-16
+does not restore that. **Keep 40.** Occupancy-shape A/Bs are closed.
+Incumbent remains **40.79**, not 50 (−18%, 24.52 → 20.0 ms/token). Next was
+CTX=4096 decode-mix recapture.
+
+## 32. Session ISA (2026-09-23): CTX=4096 mix is 79% GEMV; host is not the 50-gap
+
+`decode_profile.py` on `goal-isa-swizzle` (MULT=2, rows=40). Unprofiled
+reference **41.11 tok/s** over 64 tokens (24.32 ms/token), consistent with
+the 4096/256 median 40.79. Profiled wall 6.182 s includes a full 4096-token
+**prefill** (first iterate mix). Recapture with prefill drained is in flight.
+
+Prefill-contaminated device 4992 ms / 6.18 s wall → 81% busy is **not** the
+decode host gap. Session-2 HIP-API (~1–3 ms idle) still stands for decode.
+
+Decode-relevant kernels in that capture (64 tokens; hipBLAS / reconstruct /
+exl3_gemm / paged_attn_prefill / GDN-chunk treated as prefill):
+
+| family | ms | ms/token | share of 24.32 ms |
+|---|---|---|---|
+| `exl3_gemv_int8` sq+msq | 1227 | **19.17** | **79%** |
+| rms_norm / gated_rms | 72 | 1.13 | 4.6% |
+| paged-attn decode | 67 | 1.05 | 4.3% |
+| GDN recurrent + conv1d + ba_gemv | ~99 | 1.55 | 6.4% |
+| act_mul | 38 | 0.60 | 2.5% |
+| rope / kv_update / fused_op | ~18 | 0.28 | 1.1% |
+
+Zeroing attn+GDN+norm+act (~4.3 ms) without touching GEMV tops out ~49 tok/s
+and is not realistic. **50 still needs GEMV ~24% faster** (19.17 → ~14.7 ms).
+
+Hot GEMV is `sq_kernel<3>` (330 ms, 56 µs) and `sq_kernel<4>` residual-on
+(199 ms, 38 µs). Confirmed `isa-swizzle-r40-dump` opcode census (whole kernel):
+
+| kernel | insns | `v_dot4` | `v_mul_lo` | DPP | `ds_bpermute` | `ds_swizzle` | `global_load_b64` |
+|---|---|---|---|---|---|---|---|
+| sq K=3 M=1 r-off | 1557 | 32 | 33 | 40 | **40** | 6 | 4 |
+| sq K=4 M=1 r-on | 1705 | 48 | 49 | 43 | **40** | 6 | 7 |
+| msq K=4 r-on | 2706 | 32 | 34 | 54 | 80 | 12 | 11 |
+
+xmask dump had 45 `ds_bpermute` + 0 swizzle. xor-16 converted ~5–6 of those to
+`ds_swizzle` (slice-max / row-sum xor-16). The remaining **40 `ds_bpermute`**
+match input+output Hadamard: `had_hf_r_128_inner` + `had_fh_r_128_inner`, each
+`shuffle_had_f4x32` = 5 xor steps × 4 floats = 20 shuffles. Those still lower
+to `ds_bpermute` because `had_xmask` is not in this image. VALU-bound inner
+loop is 48 `v_dot4` + 49 `v_mul_lo`; BUFFER_LOAD / STREAM / 24-bit hash / VOPD
+/ WMMA already closed.
+
+Hadamard DPP/SWAPX16 (`had_xmask`) is a **decode GEMV** lever (sq stage_slice
++ epilogue), not only prefill `reconstruct_had`. Image `goal-isa-had` built
+(`had_xmask` in `/opt/exllamav3/.../hadamard_inner.cuh`). A/B vs 40.79 in
+flight. Do not expect it to close 50 by itself (40 shuffles vs 48 dots).
+
+## 33. Session ISA (2026-09-23): decode-only mix — GEMV 18.3 ms, host ~3.1 ms
+
+Prefill-drained recapture (`swizzle-r40-dec`). Drain iters=3 (first streaming
+token excluded). Unprofiled reference **40.35 tok/s** / 64 tokens (24.78
+ms/token). Profiled wall 2.496 s / 1366 ms device = 55% busy is **profiler
+overhead**; do not treat 45% as the decode host gap.
+
+63 profiled tokens (64 − first streaming):
+
+| family | ms | ms/token | share of 24.78 ms |
+|---|---|---|---|
+| `exl3_gemv_int8` sq+msq | 1152 | **18.29** | **74%** |
+| paged-attn decode split+combine | 63 | 1.00 | 4.0% |
+| GDN recurrent + conv1d + ba_gemv + fused | 81 | 1.28 | 5.2% |
+| rms_norm + gated_rms | 43 | 0.68 | 2.7% |
+| act_mul + sigmoid | 7 | 0.10 | 0.4% |
+| rope + kv_update | 9 | 0.14 | 0.6% |
+| other device (add/elem/copy) | 11 | 0.18 | 0.7% |
+| host idle (unprofiled − device) | — | **~3.1** | **12%** |
+
+Hot GEMV (avg): `sq<3>` 55 µs × 5796, `msq<4 r-on>` 66 µs × 3023, `sq<4 r-on>`
+38 µs × 5166, `sq<3 r-on>` 58 µs, `sq<4 r-off>` 60 µs, `sq<6>` 1175 µs × 63.
+No hipBLAS / reconstruct / exl3_gemm in this window.
+
+**50 still needs GEMV ~26% faster.** Host-to-zero tops out ~46.7 tok/s.
+
+`goal-isa-had` ISA census (same kernels, `had_xmask` compiled in):
+
+| kernel | insns | DPP | `ds_bpermute` | `ds_swizzle` | `s_waitcnt` |
+|---|---|---|---|---|---|
+| sq K=3 r-off swizzle | 1557 | 40 | 40 | 6 | 76 |
+| sq K=3 r-off **had** | **1250** | **72** | **0** | **14** | **47** |
+| sq K=4 r-on swizzle | 1705 | 43 | 40 | 6 | 78 |
+| sq K=4 r-on **had** | **1406** | **75** | **0** | **14** | **48** |
+
+Inner loop unchanged (48 `v_dot4` + 49 `v_mul_lo`). Hadamard shuffles moved
+to VALU (`v_mov_b32_dpp` + `ds_swizzle`); LDS `s_waitcnt` dropped ~40%. e2e
+completed below.
+
+## 34. Session ISA (2026-09-23): Hadamard DPP/SWAPX16 is a keep (+1.2% → 41.30)
+
+`goal-isa-had` (`had_xmask` DPP ROW_XMASK 1/2/4/8 + DS_SWIZZLE SWAPX16) vs
+`goal-isa-swizzle` (Hadamard still `shfl_xor` → `ds_bpermute`). Same env:
+`EXL3_SQ_GRID_MULT=2 EXL3_SQ_ROWS_PER=40`. Token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| xor-16 + rows=40 (`isa-swizzle-r40.json`) | 40.79 | 40.87 / 40.79 / 40.74 | (ref) | grid=288 maxb=3 |
+| **+ had_xmask** (`isa-had-r40.json`) | **41.30** | 41.39 / 41.30 / 41.19 | **true** | grid=384 maxb=4 |
+
++1.2%. No run overlap (min had 41.19 > max swizzle 40.87). Occupancy API
+`maxb` 3→4 (LDS `s_waitcnt` 78→48, `ds_bpermute` 40→0). Grid 288→384 is the
+same MULT=2 × sms=48 × maxb. Inner loop still 48 `v_dot4` + 49 `v_mul_lo`.
+
+**Keep `had_xmask`.** New incumbent **41.30**, still not 50 (−17%, 24.21 →
+20.0 ms/token). Next was rows_per=48 at maxb=4.
+
+## 35. Session ISA (2026-09-23): rows_per=48 at maxb=4 is a miss (−1.0%)
+
+`EXL3_SQ_ROWS_PER=48` on `goal-isa-had` vs `isa-had-r40.json` (41.30).
+Env only, same image, token parity true. Occupancy stayed `maxb=4` / grid=384.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **rows=40** (`isa-had-r40.json`) | **41.30** | 41.39 / 41.30 / 41.19 | (ref) | grid=384 ksplit=8 |
+| rows=48 (`isa-had-r48.json`) | 40.89 | 40.98 / 40.89 / 40.83 | **true** | grid=384 ksplit=7 |
+
+−1.0%. All three r48 runs sit below all three r40 runs. Taller slices still
+lose occupancy even after Hadamard freed LDS (`maxb` 3→4). **Keep 40.**
+Occupancy-shape closed at maxb=4 as well (32/40/48/56/64). Next was decode-only
+recapture.
+
+## 36. Session ISA (2026-09-23): Hadamard mix — occupancy win, not shorter GEMV
+
+Prefill-drained recapture (`had-r40-dec`) on `goal-isa-had`. Drain iters=3.
+Unprofiled reference **41.47 tok/s** / 64 tokens (24.11 ms/token). Profiled
+wall 2.049 s / 1369 ms device = 67% busy is **profiler overhead**.
+
+63 profiled tokens:
+
+| family | ms | ms/token | share of 24.11 ms | vs swizzle-r40-dec |
+|---|---|---|---|---|
+| `exl3_gemv_int8` sq+msq | 1153 | **18.30** | **76%** | 18.29 (unchanged) |
+| paged-attn decode | 64 | 1.01 | 4.2% | 1.00 |
+| GDN recurrent + conv1d + ba_gemv | 79 | 1.25 | 5.2% | 1.28 |
+| rms_norm + gated_rms | 43 | 0.69 | 2.9% | 0.68 |
+| other device | 30 | 0.48 | 2.0% | 0.44 |
+| host idle (unprofiled − device) | — | **~2.38** | **10%** | was ~3.1 |
+
+Hot GEMV avgs unchanged: `sq<3>` 55.8 vs 55.1 µs, `sq<4 r-on>` 37.4 vs 37.7,
+`msq<4 r-on>` 65.9 vs 66.4, `sq<6>` 1143 vs 1175. Hadamard removed 40
+`ds_bpermute` and raised occupancy 3→4; it did **not** cut VALU inner-loop
+time (48 `v_dot4` + 49 `v_mul_lo` on K=4; K=3 is still 32-dot narrow extract).
+
+CU-mode occupancy wall: 4 × 256-thread blocks = 32 waves = 2 SIMD32 × 16
+slots. **maxb=4 is the ceiling** for this block size. GRID_MULT=2 × sms=48
+× maxb=4 = 384 = 4/CU, occupancy fill. Occupancy-shape closed. Host-to-zero
+tops out ~45.8 tok/s.
+
+**50 still needs GEMV ~24% faster.** Inner loop: K=4 VALU (`v_mul_lo`+`v_dot4`);
+K=3 is 7.76 ms/token on scattered `ext8w` (2 global loads/extract, wrap_idx).
+Closed: VOPD, WMMA, packed 16, 24-bit hash, BUFFER_LOAD (K=4), STREAM,
+NARROWN, STAGE_SMEM, A15 K=3 register pipeline, A12 prefetch, rows 32/48/56/64.
+
+## 37. Session ISA (2026-09-23): GRID_MULT=3 at maxb=4 is a miss (−5.9%)
+
+`EXL3_SQ_GRID_MULT=3 EXL3_SQ_ROWS_PER=40` on `goal-isa-had` vs
+`isa-had-r40.json` (41.30). Env only, same image, token parity true.
+
+| arm | median tok/s | runs | parity | sq k=5120 n=17408 |
+|---|---|---|---|---|
+| **MULT=2** (`isa-had-r40.json`) | **41.30** | 41.39 / 41.30 / 41.19 | (ref) | grid=384 maxb=4 |
+| MULT=3 (`isa-had-r40-g3.json`) | 38.86 | 38.94 / 38.86 / 38.79 | **true** | grid=576 maxb=4 |
+
+−5.9%. 576 = 6 blocks/CU; occupancy is maxb=4 (4/CU = 384). Same oversubscribe
+pattern as CU MULT=3 at maxb=3 (36.93 vs 38.36) and WGP MULT=2. **Keep MULT=2.**
+Do not raise the default. Occupancy fill is the CU-mode wave-slot ceiling
+(4 × 256-thread = 32 waves). Next was rows_per=36 — invalid, rounds to 40.
+
+## 38. Session ISA (2026-09-23): rows_per=36 is a no-op (rounds to 40)
+
+`EXL3_SQ_ROWS_PER=36` on `goal-isa-had`. Host `(n+7)&~7` → 40. Launch log
+`rows_per=40`, grid=384. Token parity true.
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| **rows=40** (`isa-had-r40.json`) | **41.30** | 41.39 / 41.30 / 41.19 | (ref) |
+| ROWS=36 (`isa-had-r36.json`) | 41.18 | 41.28 / 41.18 / 41.13 | **true** |
+
+−0.3%, overlapping. No hole between 32 and 40: legal values are multiples of 8,
+`>= SQ_MINROWS=16`. Occupancy-shape closed. Next: K=3 `ext8w` independent BFE
+(7.76 ms/token of GEMV; serial `>>3` chain vs K=4's independent `v_bfe`).
+
+## 39. Session ISA (2026-09-23): K=3 independent BFE is a wash (−0.17%)
+
+`goal-isa-k3ext`: `ext8w` bits==3 uses two funnel shifts + independent `BFE16` instead of the
+serial `w >>= 3` chain. Token parity true. Same env (MULT=2 rows=40).
+
+| arm | median tok/s | runs | parity |
+|---|---|---|---|
+| **serial extract** (`isa-had-r40.json`) | **41.30** | 41.39 / 41.30 / 41.19 | (ref) |
+| independent BFE (`isa-had-k3ext.json`) | 41.23 | 41.31 / 41.23 / 41.16 | **true** |
+
+−0.17%, overlapping. Incumbent K=3 sq M=1 r-off already has 25 `v_bfe_u32` and only 4
+`v_lshrrev_b32` — hipcc already broke the chain. **Revert.** Occupancy-shape and K=3
+extract ILP are closed. 50 still needs GEMV ~24% faster (VALU `v_mul_lo`+`v_dot4`).
+
+24-bit hash split was three VALU ops vs one `v_mul_lo` (−27% at ILP 8). Next is a
+**2×256 LDS LUT**: `w*C == T0[w&255]+T1[w>>8]`. Two `ds_load_b32` can issue on the
+LDS pipe against `v_dot4`; that is a different bet than the VALU split. Isolated
+probe `profiling/hash_lut_probe.hip` before any e2e wire-up. Do not rebuild the
+extension unless the probe beats `mul+dot` at ILP 8/16 (consume_row shape) with
+0 mismatches.
+
+## 40. Stop (2026-09-23): 50 not reached; incumbent 41.30 rechecked
+
+User stop. Do not claim 50. Best measured 4096/256 b1 greedy (no speculation,
+fp16 KV) remains `isa-had-r40.json` on `exllamav3-rocm:goal-isa-had`:
+
+| run | engine tok/s |
+|---|---|
+| 1 | 41.387 |
+| 2 | **41.296** |
+| 3 | 41.193 |
+| **median** | **41.30** |
+
+Live recheck on the same image (`had-r40-recheck.json`, same env
+`EXL3_SQ_GRID_MULT=2 EXL3_SQ_ROWS_PER=40`): 41.313 / **41.258** / 41.201,
+median **41.26**. Token IDs match `isa-had-r40.json` and the pre-ISA golden
+`final-post-revert.json` (33.00 tok/s era). 89 saved 4096/256 JSONs share
+fingerprint `5c2c9f75e76d`. Three-run self-match true. ELF
+`.workgroup_processor_mode` all `0x00` (CU). Launch log `grid=384 maxb=4
+sms=48 rows_per=40`.
+
+GEMV numerical (`test_msq_ab.py` on this image): **PASS**. msq vs per-matrix
+int8 is bit-exact (rel_rms 0) at m=1 and m=4, sliced and plain. msq vs coop
+rel_rms 0.006-0.008 (tolerance 0.02; per-slice vs global scales, by design).
+Repeat-identical true.
+
+Natural greedy smoke (`The capital of France is`, 64 tok): loops
+`France is` (ids 9338, 369). The 4096/256 bench prompt likewise period-14
+repeats a rotation of the filler sentence; that sequence is identical to the
+pre-optimization golden, so it is not an ISA regression. The short-prompt
+loop is a 3.5bpw greedy quality observation, not a kernel-parity failure.
+
+50 is **not** reached (-17%; 24.21 ms/token vs 20.0). Host-to-zero caps
+~45.8. GEMV is still 18.3 ms/token (76% of wall).
+
+## 41. Session resume (2026-09-30): five new misses; GEMV streaming wall confirmed structural
+
+Resumed on `exllamav3-rocm:goal-50tps-3e6bd94` (3e6bd94 + dirty ISA tree, CU-mode).
+Baseline recheck: `resume-baseline.json` 41.42 / **41.36** / 41.28 = **41.36**
+median, consistent with §40's 41.30. Decode-only recapture `resume-dec`
+(`decode_profile.py`, CTX=4096, 64 tok): unprofiled 41.43 tok/s, device
+1362ms/63tok; sq<3> 320.8, msq<4 r-on> 197.7, sq<4 r-on> 192.5, sq<3 r-on>
+165.3, sq<4 r-off> 138.5, **sq<6> (lm_head k=5120 n=248320) 72.0 ms =
+1143 µs/token ≈ 834 GB/s**, msq<4 f32> 57.9, paged-attn split+combine 63.2,
+GDN chain 67.9, norms 26.1, misc ~30. GEMV block 17.9 ms/token.
+
+New measured closures (all vs the resume baseline, canonical 4096/256 greedy):
+
+| arm | median tok/s | vs 41.36 | verdict |
+|---|---|---|---|
+| narrow-unit register prefetch (bits 3/5/6/8 ext8w source words, next row in cur/nxt regs) | 39.42 | **−4.7%** | reject; same lesson as A12 — narrow does not want early loads |
+| wide-unit pipeline depth 2→4 (r0..r3, +8 VGPR) | 40.01 | **−3.2%** | reject; per-warp MLP is not the limiter |
+| `EXL3_SQ_STAGE_SMEM=1` (cp.async staged unit on all K) | 39.66 | **−4.1%** | reject (re-check on had stack) |
+| `TG_KV_BITS=8` on had stack | 40.41 | **−2.3%** | reject (Attempt-10 re-check, still flat) |
+| 2×256 LDS LUT for `w*0x83DCD12D` (`hash_lut_probe.hip`) | — | probe | reject: lut+dot 41.7 vs mul+dot 69.6 G hash/s at ILP 8; 2×ds_load loses to 1×v_mul_lo |
+
+lm_head standalone (`profiling/lmhead_bench.py`, K=6 n=248320, 954 MB/call):
+800–827 GB/s across force_sms {0,96,192,384,768}, rows_per {40,80,160},
+STAGE_SMEM {0,1} — flat. Not launch geometry, not per-warp MLP (narrow-pf
+unchanged at 813), not unit choice (smem same). The GEMV wall is DRAM
+sector/TLB throughput on this access pattern: every shape caps at
+300–830 GB/s regardless of unit (narrow/wide/smem), pipeline depth, or grid.
+
+Remaining documented levers are unchanged from §14.5: whole-step graph
+capture (host gap 2.4–3.1 ms → ~1 ms would land ~45–46 tok/s, still short),
+GDN micro-chain fusion (~1 ms device). 50 via GEMV alone is closed by
+measurement: the unit must stream ≥1.4× more bytes/s than every unit type
+attains on real tensors.
+
+## 42. Session resume (2026-09-30): trellis repack probe — closed (lm_head is math-bound)
+
+`profiling/repack_probe.hip`: K=6 narrow-unit inner loop (ext4w x2 + hash mul +
+dp4a per block pair) over a lm_head slice (rows 0..39, 7760 pairs). MODE 0 =
+legacy scattered 4B loads per lane; MODE 1 = repacked `B2[kb][pair][lane][8]`
+contiguous 32B/lane (2x uint4). Checksums bit-identical (0 mismatches) — the
+repack mapping is exact.
+
+| arm | GB/s |
+|---|---|
+| scattered cold | 1333 |
+| repacked | **871** |
+| scattered warm (119 MB slice fits Infinity Cache) | 2182 |
+| repacked warm | 869 |
+
+Repacked sequential streaming is *slower* than scattered warm and equal to the
+real lm_head rate (834 GB/s e2e): the K6 unit is already at the extract+hash+dp4a
+issue bound, not the DRAM pattern. The repack lever is closed; full integration
+dropped.
+
+Corollary for the 50 tps budget: device floor = GEMV 18.3 + attn/GDN/norm 3.4 =
+21.7 ms/token ≈ **46 tps** even with zero host idle. 50 is unreachable without
+either (a) fewer weight bytes/token (different quant format — out of scope) or
+(b) speculation (user-closed §5). Whole-step graph capture (scout report
+SuccessiveWren) tops out at ~45-46 tps for this reason.
+
+## 43. Whole-step graph capture (EXL3_STEP_GRAPH) — implemented, closed as regression
+
+Implementation (kept, env-gated): `Generator._sg_forward` in generator.py captures
+fwd_modules[1:] (all modules after the CPU embedding gather) into a
+torch.cuda.CUDAGraph keyed by (bsz, ids_width, block_table width, recurrent
+slots). Pinned staging uploads record as memcpy nodes; recurrent-state device
+updates ride along in-graph; host bookkeeping (r.position) replicated on the
+replay path. ext `Graph::disabled` honors EXL3_STEP_GRAPH so BC modules run their
+kernel sequence eagerly inside the outer capture (hipGraphLaunch-in-capture is
+dead on ROCm and BC arg patching is a host call that never replays).
+`SlicedMultiLinear.c_ptrs` stages through a persistent pinned buffer so the
+pointer table records as a memcpy node.
+
+Measured (goal-50tps-sg image, canonical 4096/256):
+- capture engages cleanly (66 modules, key=(1,1,{16,32})), 3-run self-parity PASS
+- 37.2 tps vs 41.3 baseline = **-10%**
+
+Microbenchmark (/tmp/graphbench.py): 800-node graph replay = 3.22 us/node
+device-side dispatch on gfx1100 (~2574 us/replay) vs 5.28 us/kernel eager
+enqueue. The eager pipeline's enqueue cost is already hidden under GPU work;
+the serial per-token cost is the post-sync host tail (~2.5 ms: sync, receive_sample
+bookkeeping, staging, CPU embedding gather). An ~800-node whole-step graph swaps
+that ~2.5 ms tail for ~2.5 ms of serial node dispatch: net ~zero, then negative
+because BC's ~130 nodes were already replayed cheaply (and BC kernels run eager
+inside the step graph carry extra arg-fixup cost). Same mechanism as the §14.2
+BC-attn regression, now measured at whole-step scale.
+
+Remaining lever to reach the 46 tps device ceiling: the post-sync host tail must
+overlap the next step's GPU execution — i.e. launch step N+1 immediately after
+the token readback, run receive_sample/staging while the GPU works. That needs
+device token feedback (sampler writes the input-ids buffer in-graph) and
+deferred host bookkeeping — a generator restructure, not a kernel change.
+
+## 44. Prefill host-drain fixes (pinned staging + async recurrent stash)
+
+Cold-2k prefill (bench_lean, nonce-poisoned so no prefix-cache hits):
+**548 → 771 tok/s (+41%)**; profiled 2063-token job 1689 ms wall vs 1861 ms
+device (~98% GPU-busy, was ~72%). Greedy A/B vs clean image: identical token
+stream. Decode unaffected (42.2 tok/s on goal-50tps-3e6bd94 .so).
+
+Sources of the ~1.4 s host stall removed:
+- `Job.recurrent_checkpoint` -> `RecurrentCache.put` -> per-layer
+  `*.stash()` did `.cpu()` on recurrent/conv state: blocking D2H per layer
+  per page-boundary chunk = 96 x ~14 ms hipMemcpyWithStream for 2 chunks.
+  Fix: stash into pinned buffers with `non_blocking=True` (CachingHostAllocator
+  records stream events on free; unstash H2D is stream-ordered). Applied in
+  gated_delta_net, short_conv, sliding_attn, ple.
+- Embedding CPU output: `pinned_staging` param + double-buffered pinned ring
+  with deferred cuda events (buffers alternate; writer waits on the event
+  recorded after the buffer's previous upload was enqueued).
+- `seq.sequence_ids` pinned (SeqTensor pin flag, growth preserved) and
+  `block_index_tensor` allocated pinned -> prefill_ids slices + block table
+  upload async.
+- `cache_seqlens`: fresh 4-byte pinned tensor per chunk. Do NOT reuse one
+  buffer: the host writes the next chunk's value while the previous upload
+  is still queued behind ~700 ms of GEMMs (observed-as-designed allocator
+  event tracking makes per-chunk allocs safe).
+
+Gotchas:
+- `pin_memory=True` under ROCm goes through torch's CachingHostAllocator;
+  `hipHostMalloc` cost (~1 ms/pinned alloc, 98 allocs = 93 ms) is the
+  remaining prefill host line — could be pooled, not worth it yet.
+- bench_lean's original head-only nonce let prefix-cache hits mask ~40% of
+  prefill; nonce now interleaved every 96 positions.
+- HIP extension rebuilds are NOT bit/perf-reproducible in practice:
+  goal-50tps-3e6bd94 .so = 42.3 dec, goal-50tps-sg (dirty kernel WIP) =
+  37.3, goal-50tps-fix1 (HEAD kernels + CUMODE) = 32.6. The shipped .so is
+  the best binary found; kernel WIP (xmask DPP, sq_k4 variants) regressed
+  decode in this state. Serve overlay keeps old .so + repo python via
+  sys.path shadowing.

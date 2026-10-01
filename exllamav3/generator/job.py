@@ -1378,15 +1378,25 @@ class Job:
                         ids, self.embeddings, ids.shape[-1]
                     )
 
+                # Fresh pinned tensor per chunk: the upload is enqueued behind this
+                # chunk's compute, so a reused buffer would be overwritten by the
+                # host before its H2D lands. The caching host allocator records a
+                # stream event on free and won't hand the block out again until
+                # the copy completes.
+                cache_seqlens = torch.empty((1,), dtype = torch.int32, pin_memory = True)
+                cache_seqlens[0] = prefill_start
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
-                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "cache_seqlens": cache_seqlens,
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
+                    # Same staging contract as iterate_gen: CPU embedding output is
+                    # copied into a reused pinned buffer, then uploaded async.
+                    "pinned_staging": True,
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)

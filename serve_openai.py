@@ -17,7 +17,12 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Union
 
-from serve_rocm import app, state, _lock, MODEL_DIR, submit_job, cancel_job, finish_job
+from serve_rocm import app, state, _lock, MODEL_DIR, submit_job, cancel_job, finish_job, MAX_TOKENS
+
+# Omitted max_tokens used to default to the full cache (200k here). Non-streaming
+# chat then generated until EOS/cache, and thinking hid visible content for that
+# entire run. Cap the default; clients that want more send max_tokens explicitly.
+DEFAULT_MAX_NEW = min(int(os.environ.get("EXL3_MAX_NEW_TOKENS", "2048")), MAX_TOKENS)
 from exllamav3 import Job
 from exllamav3.generator.sampler import ComboSampler, GreedySampler
 
@@ -32,7 +37,6 @@ app.add_middleware(
 )
 
 MODEL_NAME = os.environ.get("EXL3_MODEL_NAME", os.path.basename(MODEL_DIR.rstrip("/")))
-MAX_TOKENS = int(os.environ.get("EXL3_CACHE_TOKENS", "32768"))
 THINK_CLOSE = "</think>"
 THINK_TAIL = len(THINK_CLOSE) - 1  # hold-back for partial-tag chunk boundaries
 
@@ -91,6 +95,10 @@ def _normalize_messages(req: "ChatReq") -> list[dict]:
 
 def _template_kwargs(req: "ChatReq") -> dict:
     kw = dict(_EFFORT_MAP.get(req.reasoning_effort or "", {}))
+    # vLLM-style top-level enable_thinking (bench9001 sends this); explicit
+    # reasoning_effort beats it, chat_template_kwargs beats both.
+    if req.enable_thinking is not None and req.reasoning_effort is None:
+        kw["enable_thinking"] = req.enable_thinking
     if req.tools and req.tool_choice != "none":
         kw["tools"] = [t.model_dump(exclude_none=True) for t in req.tools]
     kw.update(req.chat_template_kwargs or {})  # explicit kwargs win
@@ -144,6 +152,7 @@ class ChatReq(BaseModel):
     tool_choice: Optional[Union[str, dict]] = None
     parallel_tool_calls: Optional[bool] = True
     reasoning_effort: Optional[str] = None
+    enable_thinking: Optional[bool] = None
     chat_template_kwargs: Optional[dict] = None
     user: Optional[str] = None
 
@@ -302,7 +311,7 @@ async def _collect_with_abort(q, cancel_ev, request: Request):
             cancel_ev.set()  # worker cancels its own job on exit
             task.cancel()
             raise ClientDisconnect()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.05)
     return await task
 
 
@@ -425,7 +434,7 @@ async def _sse_stream(q, cancel_ev, request: Request, kind: str, split_think: bo
             if await request.is_disconnected():
                 return
             try:
-                typ, payload = await asyncio.to_thread(q.get, True, 0.5)
+                typ, payload = await asyncio.to_thread(q.get, True, 0.05)
             except queue.Empty:
                 continue
             if typ == "job":
@@ -520,7 +529,7 @@ async def chat_completions(req: ChatReq, request: Request):
 
     if req.stream:
         try:
-            q, cancel_ev, n_prompt = _start_generation(prompt, req, MAX_TOKENS)
+            q, cancel_ev, n_prompt = _start_generation(prompt, req, DEFAULT_MAX_NEW)
         except Exception as e:
             return _err(str(e))
         return StreamingResponse(
@@ -535,7 +544,7 @@ async def chat_completions(req: ChatReq, request: Request):
     total_prompt = total_new = 0
     for i in range(n):
         try:
-            q, cancel_ev, n_prompt = _start_generation(prompt, req, MAX_TOKENS, seed_offset=i)
+            q, cancel_ev, n_prompt = _start_generation(prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
             text, result = await _collect_with_abort(q, cancel_ev, request)
         except ClientDisconnect:
             return JSONResponse(status_code=499, content={})
@@ -579,7 +588,7 @@ async def completions(req: CompletionReq, request: Request):
 
     if req.stream:
         try:
-            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, MAX_TOKENS)
+            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, DEFAULT_MAX_NEW)
         except Exception as e:
             return _err(str(e))
         return StreamingResponse(
@@ -593,7 +602,7 @@ async def completions(req: CompletionReq, request: Request):
     total_prompt = total_new = 0
     for i in range(n):
         try:
-            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, MAX_TOKENS, seed_offset=i)
+            q, cancel_ev, n_prompt = _start_generation(req.prompt, req, DEFAULT_MAX_NEW, seed_offset=i)
             text, result = await _collect_with_abort(q, cancel_ev, request)
         except ClientDisconnect:
             return JSONResponse(status_code=499, content={})
