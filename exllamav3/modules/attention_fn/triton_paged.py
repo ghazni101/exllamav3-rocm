@@ -1092,11 +1092,12 @@ def _attn_output_canary(tag: str, out: torch.Tensor, q: torch.Tensor):
     global _canary_warned
     if _attn_canary == 0:
         return
-    o = out.float()
-    if not torch.isfinite(o).all():
+    # No full-tensor .float() copy: on the >2^31-offset overflow tests the output
+    # alone is ~8 GB and the copy OOMs the canary itself
+    if not bool(torch.isfinite(out).all()):
         raise RuntimeError(f"paged_attn_{tag}: non-finite output "
                            f"(q norm {q.float().norm():.3e})")
-    dead = (o.abs().amax(dim=tuple(range(1, o.ndim))) == 0)
+    dead = (out.abs().amax(dim=tuple(range(1, out.ndim))) == 0)
     if bool(dead.any()):
         msg = (f"paged_attn_{tag}: {int(dead.sum())}/{dead.numel()} all-zero rows "
                f"(q norm {q.float().norm():.3e})")

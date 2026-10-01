@@ -88,18 +88,33 @@ anyway. Measured worst model-level KLD for that rounding is 1.9e-3
 (vs 1e-3 gate default) — when A/B-ing across that default change, set
 `NUMCHECK_MAXDIV` and `NUMCHECK_KLD` accordingly, or compare like with like.
 
-## Known ROCm-open issue: transient all-zero triton prefill output
+## Known ROCm-open issue: transient wrong triton prefill output (full-suite only)
 
-2026-10-01: one full-suite run produced all-zero output from
-`paged_attn_triton_prefill` for every test in `test_triton_paged_hdpad.py`
-(rel err 1.0), including the power-of-two head-dim control; six later attempts
-(solo file warm/cold, full suite warm/cold/CPU-loaded, standalone repro) all
-pass. Signature — kernels run but compute against zeroed inputs across a whole
-test file — points at a transient launcher/arg-staging race in triton-rocm,
-not at kernel math. `EXL3_ATTN_CANARY=1` (warn) / `2` (raise) instruments the
-output for detection in serve/CI until this is pinned;
-`bench/stress_triton_prefill.py` is the hammer. If it reproduces, capture
-triton-rocm version and file upstream.
+2026-10-01, updated after the upstream-dev merge: full `pytest tests/` runs
+intermittently (~3 of 12 observed) fail 26-36 tests in
+`test_triton_paged_hdpad.py` with rel err ~1.0 — prefill, nocache and
+quantized-cache variants, while every decode variant passes. Pre-dates the
+upstream merge (first seen on the cac783b build). Characterization so far:
+
+- NOT reproduced by: the file alone (warm or cold), any in-order subset of the
+  suite, 6000-iteration randomized stress across shapes/head dims/windows
+  (`bench/stress_triton_prefill.py`), or in-process GPU memory pressure up to
+  20 GB hauled.
+- Only full-suite processes trigger it, probabilistically; the same command
+  passes 5+ times in a row between occurrences.
+- With `EXL3_ATTN_CANARY=2` the failures convert to RuntimeErrors at the
+  prefill exit, confirming the wrapper returns wrong output rather than the
+  tests mis-comparing. (The canary itself no longer materializes a float copy
+  of the output — on the >2^31-offset overflow test that copy OOMs.)
+- Suspected, unproven: interference from a co-resident GPU process (this
+  machine runs a standing serve that parks/unparks around lock windows); lock
+  history shows no concurrent lock holder during failing runs, but the parked
+  serve's residency was not recorded per run.
+
+`EXL3_ATTN_CANARY=1` (warn; serve default) / `2` (raise) instruments decode
+and prefill exits for detection in serve/CI until this is pinned. If it
+reproduces, capture triton-rocm version + the canary message and file upstream
+against triton-rocm.
 
 ## Testing
 
