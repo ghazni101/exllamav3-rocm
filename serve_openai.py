@@ -253,9 +253,10 @@ def _run_job(prompt_ids, max_new_tokens, sampler, stop_conds, seed, out_q, cance
             if r.get("eos"):
                 result = r
                 held = r.get("held") or {}
-                if held.get("text"):
-                    # stop-string EOS emits held-back text only here; without this
-                    # the tail of the completion is silently truncated
+                # Flush held-back tail text - except on a stop-token EOS, where the
+                # held buffer still contains the stop token's own text (emit_held
+                # stays False there precisely so it is not emitted)
+                if held.get("text") and result.get("eos_reason") != "stop_token":
                     out_q.put(("text", held["text"]))
                 break
         if cancel_ev.is_set() and not result:

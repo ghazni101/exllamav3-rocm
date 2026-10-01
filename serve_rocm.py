@@ -179,10 +179,12 @@ def generate(req: GenReq):
                 raise HTTPException(500, f"generation failed: {r.get('error')}")
             if r.get("text"):
                 chunks.append(r["text"])
-            held = r.get("held") or {}
             if r.get("eos"):
                 result = r
-                if held.get("text"):
+                held = r.get("held") or {}
+                # Same rule as serve_openai: flush held tail text except on a
+                # stop-token EOS, where held text includes the stop token itself
+                if held.get("text") and result.get("eos_reason") != "stop_token":
                     chunks.append(held["text"])
                 break
     finally:
