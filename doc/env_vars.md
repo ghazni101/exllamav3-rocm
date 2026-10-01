@@ -135,26 +135,6 @@ also *unfused* from the batched MGEMM when each matrix is wide enough to fill th
 own. See the two thresholds below. The graphed decode paths (BC modules) handle both the fused
 and unfused configurations.
 
-### `EXL3_SQ_STREAM` (default: `0`)
-
-K=4 wide-unit trellis loads with SLC (L2 stream) and DLC (Infinity Cache no-allocate).
-`0` keeps the ordinary `global_load_b64`; `1` uses `__builtin_nontemporal_load`
-(ISA §4.1.1). The choice selects a different kernel instantiation, so set it before
-the first launch (captured graphs keep the pointer they recorded). Measured on
-gfx1100 Qwen3.8-27B-3.5bpw 4096/256: no extra win over the always-on DPP rotate
-(35.36 vs 35.40 tok/s, token-identical); leave off. Only the sq encodings pick up
-`slc dlc`; msq uses saddr addressing and LLVM drops the hint.
-
-### `EXL3_SQ_BUFFER_LOAD` (default: `0`)
-
-K=4 wide-unit trellis loads via `BUFFER_LOAD_B64` (ISA §9 / §16.16) against a
-uniform V# (`__builtin_amdgcn_make_buffer_rsrc`, flags `0x31004000` (CK gfx11 V# word3)).
-This is the texture-cache L0 path; default `global_load_b64` uses vector L0.
-`1` selects a different kernel instantiation (set before first launch). Mutually
-exclusive with `EXL3_SQ_STREAM` (buffer wins). Isolated probe 0-mismatch vs
-`global_load` (flags `0x31004000`), synthetic 4747 vs 2468 GB/s. e2e on
-CU-mode+MULT=2: **37.37 vs 38.36** (−2.6%, token-identical). Leave off.
-
 ### `EXL3_SQ_GRID_MULT` (default: `1`, or `2` with `-mcumode`; cap `8`)
 
 Scales the occupancy-derived sq/msq grid (`maxb * num_sms * MULT`, cap 2048).
@@ -174,21 +154,6 @@ grid=384): 40 is **41.30**, 48 is 40.89 (−1.0%). 32 is 38.96 (−4.5%), 56 is
 39.64 (−2.3%), 64 is 39.26 (−3.3%). Occupancy peak is 40. 36 rounds to 40 and matches 41.30 within noise. Compile default 40
 only under `-DEXL3_CUMODE`.
 
-### `EXL3_SQ_ROWS_PER_NARROWN` (default: `0` = off)
-
-Override `EXL3_SQ_ROWS_PER` only for launches with `size_n/256 < 48` (down_proj
-/ o_proj on this model). WGP NARROWN=128 is 33.58 vs 35.40 (−5.1%). CU-mode +
-xor-16 + rows=40: NARROWN=64 is 40.16 vs 40.79 (−1.5%, token-identical). Leave
-off.
-
-### `EXL3_SQ_STAGE_SMEM` (default: unset = per-arch)
-
-Sq-path B-stage routing override: unset/`-1` uses `gemv_int8_stage_smem`
-(off on ROCm), `0` forces narrow, `1` stages all K. gfx1100 4096/256 (pre-CU):
-`0` is 31.79 vs the Ampere-style stage default 31.02 (+2.5%). Compile-time
-ROCm path already returns false and does not reserve the unused B-stage LDS.
-Do not force `1` on the CU keep — extra LDS would drop occupancy.
-
 ### `EXL3_CUMODE` (build-time, default: off)
 
 Set to `1` at compile (`setup.py` → hipcc `-mcumode -DEXL3_CUMODE`). gfx11
@@ -198,6 +163,47 @@ CU mode pins each workgroup to one CU. Pair with `EXL3_SQ_GRID_MULT=2`
 Pair with `EXL3_SQ_ROWS_PER=40` (40.79 vs 48 at 40.59). xor-16 `DS_SWIZZLE` +
 Hadamard `had_xmask` (DPP/SWAPX16) on that pair is the incumbent **41.30**
 (occupancy maxb 3→4, grid 288→384). ELF gate: `.workgroup_processor_mode=0x00`.
+
+### `EXL3_INT8_MSQ` (default: `1`)
+
+Multi-matrix/sliced variant of the sq int8 GEMV kernel: one regular launch covers a whole
+MGEMM call (SlicedMultiLinear bundles and plain multi-matrix projections, any m) instead of
+the cooperative kernel. On gfx1100 this moves batched decode off the coop kernel entirely
+(which cannot co-reside enough blocks on RDNA for grid.sync to be safe at concurrency > 1).
+`0` restores the cooperative MGEMM path, for A/B verification.
+
+### `EXL3_HGEMM_F16OUT` (default: `1` on ROCm, `0` on CUDA)
+
+Run fp32-output reconstruct GEMMs (q/k/v/gate/up projections) with an fp16 destination slab
+and widen the result, instead of the fp32 C/D call. On RDNA3 hipBLAS runs the fp32-output
+variant ~5x slower, so this is on by default there (+60-73% on 2k-token prefill; the extra
+fp16 rounding matches the precision the residual stream already carries). `0` restores the
+exact fp32-output path.
+
+### `EXL3_RECONSTRUCT_THRESHOLD` (default: `144`)
+
+Row-count crossover between the int8 GEMV decode path and reconstruct+BLAS for EXL3
+projections. 144 is the NVIDIA-tuned default; on RDNA3 the GEMV path tops out around
+~56 tok/s while reconstruct is ~700 tok/s, so serving sets a lower threshold to keep
+chat-size prefills off the GEMV path.
+
+### `EXL3_GDN_CHUNK_MIN` (default: `8`), `EXL3_GDN_BC_MAX_QLEN` (default: `8`)
+
+Gated-delta-net gates. `CHUNK_MIN` is the minimum sequence length routed to the Triton chunk
+kernels (the old `num_v_heads` gate left 20-47-token prompts on the token-serial recurrent
+path, costing 0.5-2 s TTFT). `BC_MAX_QLEN` caps the q_len for which the fused BC GDN graph is
+built; above 8 is prefill on the torch/chunk path, so a higher cap would only capture extra
+graph variants for tiny prompts.
+
+### `EXL3_H2D_TRACE` (default: `0`)
+
+Log every pageable (non-pinned) host->device copy with a stack trace. Pageable copies
+implicitly synchronize the stream; useful when hunting host-side stalls in profiles.
+
+### `EXL3_SQ_LAUNCH_LOG` (default: `0`)
+
+Print grid geometry (grid, blocks/SM, ksplit, rows_per, k, n) for the first N sq/msq int8
+GEMV launches. Diagnostic for launch-geometry A/Bs.
 
 ### `EXL3_INT8_GEMV_MAX_K` (default: per-arch)
 

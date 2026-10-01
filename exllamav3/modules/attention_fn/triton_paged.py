@@ -1068,17 +1068,7 @@ def _paged_attn_decode_combine_kernel(
 
 _decode_sm_count = {}
 
-def _attn_splits_mult():
-    import os
-    return max(1, min(64, int(os.environ.get("EXL3_ATTN_SPLITS_MULT", "2"))))
 
-def _attn_decode_warps():
-    import os
-    return max(1, min(32, int(os.environ.get("EXL3_ATTN_DECODE_WARPS", "4"))))
-
-def _attn_decode_blockn():
-    import os
-    return max(16, min(256, int(os.environ.get("EXL3_ATTN_DECODE_BLOCKN", "0"))))
 
 def paged_attn_triton_decode(
     q: torch.Tensor,
@@ -1100,13 +1090,12 @@ def paged_attn_triton_decode(
     qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
     n_kv_heads_override: int | None = None,
-    num_warps: int | None = None,
+    num_warps: int = 4,
     num_stages: int = 2,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
     second pass. GQA sibling q heads share K/V tiles within a program."""
-    caller_warps = num_warps
     _check_tensor("q", q)
     _check_tensor("block_table", block_table, None)
     _check_tensor("cache_seqlens", cache_seqlens, None)
@@ -1164,9 +1153,6 @@ def paged_attn_triton_decode(
 
     if block_n is None:
         block_n = max(16, 8192 // hd_pad)   # K + V tiles in smem across num_stages
-        if ov := _attn_decode_blockn():
-            block_n = ov
-    num_warps = _attn_decode_warps() if caller_warps is None else caller_warps
 
     group_size = n_q_heads // n_kv_heads
     block_m = triton.next_power_of_2(q_len)
@@ -1187,11 +1173,7 @@ def paged_attn_triton_decode(
         dev = q.device.index
         if dev not in _decode_sm_count:
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-        # Split-count target multiplier (x sm_count): the cold-kernel sweep on gfx1100/Qwen3.8
-        # (b1, ~4.1k ctx, hd 256) shows the split kernel strongly split-starved at the 2x default
-        # (4 programs x 24 splits): 96 splits measured 2.1x faster per call. A/B knobs:
-        # EXL3_ATTN_SPLITS_MULT (target multiplier), EXL3_ATTN_DECODE_WARPS, EXL3_ATTN_DECODE_BLOCKN.
-        target = _attn_splits_mult() * _decode_sm_count[dev]
+        target = 2 * _decode_sm_count[dev]
         num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 

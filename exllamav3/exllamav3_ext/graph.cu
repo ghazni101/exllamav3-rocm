@@ -15,12 +15,7 @@ Graph::Graph()
 {
     ready = false;
     ready_to_record = false;
-    // EXL3_STEP_GRAPH runs the BC launch paths eagerly so their kernels record
-    // as plain nodes inside the outer whole-step torch.cuda.CUDAGraph capture
-    // (hipGraphLaunch inside capture is not reliable on ROCm, and BC arg
-    // patching is a host call that would not run on outer replay).
-    static const bool eager = getenv("EXL3_STEP_GRAPH") && getenv("EXL3_STEP_GRAPH")[0] == '1';
-    disabled = eager;
+    disabled = false;
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;

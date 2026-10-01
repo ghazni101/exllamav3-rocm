@@ -23,13 +23,6 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 import os
-from ..modules.attn import prepare_for_attn
-from ..cache.recurrent_util import prepare_for_recurrence
-
-# Whole-decode-step graph capture (EXL3_STEP_GRAPH). Captures fwd_modules[1:]
-# (everything after the CPU embedding gather) plus nothing host-side; pinned
-# staging uploads become memcpy nodes replayed with current buffer contents.
-_step_graph_enable = os.environ.get("EXL3_STEP_GRAPH", "0") != "0"
 
 class Generator:
 
@@ -199,12 +192,6 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
-        # Whole-step graph state, keyed by (batch_size, ids_width, block_table_width):
-        # None = not seen, int = eager sightings, ("failed",) = capture rejected,
-        # (graph, x_in, fwd_tail, params) = replayable.
-        self._sg_seen = {}
-        self._sg_emb = None
-        self._sg_tail = None
 
         # Buffers
         if draft_model or ngram_match_min:
@@ -939,136 +926,6 @@ class Generator:
             self.staging_buffers[key] = buf
         return buf[:rows]
 
-
-
-    def _sg_forward(self, input_ids: torch.Tensor, params: dict, max_pages_batch: int):
-        """
-        Whole-decode-step graph. Captures the model's forward tail (all modules
-        after the CPU embedding gather) into one torch.cuda.CUDAGraph. Dynamic
-        inputs stay in the usual pinned staging buffers; their H2D uploads are
-        recorded as memcpy nodes, so replay re-uploads the current contents.
-        The recurrent-state host bookkeeping that model.forward normally applies
-        is replicated manually on the replay path.
-
-        Returns the logits tensor on replay, or None when the caller must fall
-        back to the eager path (first sighting of a shape, or capture failure).
-        """
-        bsz, ids_w = input_ids.shape
-        rs = params.get("recurrent_states")
-        # The recurrent slot is baked into the captured graph's state-tensor
-        # pointers, so it must key the entry.
-        key = (bsz, ids_w, max_pages_batch,
-               tuple(r.slot for r in rs) if rs else ())
-        ent = self._sg_seen.get(key)
-
-        if isinstance(ent, tuple):
-            graph, x_in, cap_params, logits = ent
-            # Eager head: CPU embedding gather refills the pinned staging buffer
-            # the graph's first memcpy node uploads from.
-            with torch.inference_mode():
-                self._sg_emb.forward(input_ids, params)
-                graph.replay()
-            self._sg_replays = getattr(self, "_sg_replays", 0) + 1
-            # Advance the CURRENT job's recurrent-state host bookkeeping; the
-            # device tensors are shared per slot and were advanced by the replay.
-            if rs:
-                history = params.get("recurrent_history")
-                for r in rs:
-                    r.position += ids_w
-                    r.last_history = (ids_w - 1) if history else 0
-                    r.post_advance()
-            return logits
-        if ent is not None:
-            if ent == "failed":
-                return None
-            # int: eager sightings so far
-            self._sg_seen[key] = ent + 1
-            if ent < 2:
-                return None
-        else:
-            self._sg_seen[key] = 1
-            return None
-
-        # Third sighting of this shape: capture.
-        if not self._sg_emb:
-            fwd = self.model.fwd_modules
-            if not fwd[0][0].caps.get("prefer_cpu"):
-                self._sg_seen[key] = "failed"
-                return None
-            self._sg_emb = fwd[0][0]
-            self._sg_tail = fwd[1:]
-
-        try:
-            # Populate params keys exactly as model.forward's prepare_inputs does
-            # (positions alias, recurrent_slots, ...) so the recorded uploads and
-            # captured kernel args see the same tensors.
-            prepare_for_attn(input_ids, params)
-            prepare_for_recurrence(input_ids, params, self.model)
-
-            rs = params.get("recurrent_states")
-            stashes = [r.stash() for r in rs] if rs else []
-            cap_params = dict(params)
-            cap_params["dev_cache"] = {}
-
-            # Eager warmup on a side stream. Mutates KV cache at the current
-            # position and recurrent device state once; the recurrent state is
-            # restored below, and the first replay overwrites the same KV slots
-            # deterministically. BC module graphs are disabled by
-            # EXL3_STEP_GRAPH (see ext Graph ctor), so their kernels run eager
-            # here and record as plain nodes during capture.
-            emb_x = self._sg_emb.forward(input_ids, cap_params)
-            s = torch.cuda.Stream()
-            dev = self._sg_tail[0][0].device
-            s.wait_stream(torch.cuda.current_stream(dev))
-            with torch.cuda.stream(s):
-                x = emb_x.to(dev)
-                for m, instance, idx in self._sg_tail:
-                    cap_params["layer_instance"] = instance
-                    x = m.prepare_for_device(x, cap_params)
-                    x = m.forward(x, cap_params)
-            torch.cuda.current_stream(dev).wait_stream(s)
-            torch.cuda.synchronize(dev)
-
-            if rs:
-                for r, st in zip(rs, stashes):
-                    r.unstash(st)
-
-            # Capture pass records nodes only; kernels do not execute, so no
-            # device state needs restoring afterward.
-            cap_params["dev_cache"] = {}
-            emb_x = self._sg_emb.forward(input_ids, cap_params)
-            x_in = torch.empty(emb_x.shape, dtype = emb_x.dtype, device = dev)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                x_in.copy_(emb_x, non_blocking = True)
-                x = x_in
-                for m, instance, idx in self._sg_tail:
-                    cap_params["layer_instance"] = instance
-                    if m.caps.get("logits_output") and (num := cap_params.get("last_tokens_only")):
-                        x = x[..., -num:, :].contiguous()
-                    x = m.prepare_for_device(x, cap_params)
-                    x = m.forward(x, cap_params)
-                logits = x
-        except Exception as e:
-            import traceback
-            logger.warning(f"EXL3_STEP_GRAPH capture failed: {e}\n{''.join(traceback.format_tb(e.__traceback__))}")
-            self._sg_seen[key] = "failed"
-            return None
-
-        self._sg_seen[key] = (g, x_in, cap_params, logits)
-        logger.warning(f"EXL3_STEP_GRAPH captured key={key} ({len(self._sg_tail)} modules)")
-        self._sg_replays = getattr(self, "_sg_replays", 0)
-        # First real use replays immediately so this token is not skipped.
-        self._sg_emb.forward(input_ids, params)
-        g.replay()
-        if rs:
-            for r in rs:
-                r.position += ids_w
-                r.last_history = 0
-                r.post_advance()
-        return logits
-
-
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1167,14 +1024,10 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
-        batch_logits = None
-        if _step_graph_enable and draft_tokens is None and self.draft_model is None:
-            batch_logits = self._sg_forward(batch_ids, params, max_pages_batch)
-        if batch_logits is None:
-            batch_logits = self.model.forward(
-                input_ids = batch_ids,
-                params = params,
-            )
+        batch_logits = self.model.forward(
+            input_ids = batch_ids,
+            params = params,
+        )
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.

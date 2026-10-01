@@ -94,40 +94,7 @@ static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
     return nullptr;
 }
 
-static bool exl3_sq_stream_b()
-{
-    // K=4 wide-unit trellis loads (SLC+DLC via __builtin_nontemporal_load).
-    // Read once: the choice is a different kernel, and captured graphs must
-    // keep the pointer they recorded. gfx1100 4096/256: 35.36 vs DPP-only
-    // 35.40 (noise); default off. Only sq encodings get slc dlc (msq saddr
-    // drops the hint).
-    static const bool v = []
-    {
-        const char* e = getenv("EXL3_SQ_STREAM");
-        bool on = e && atoi(e) == 1;
-        if (on)
-            fprintf(stderr, "[sq-stream] K=4 trellis: builtin nontemporal (slc dlc), compiler-tracked wait\n");
-        return on;
-    }();
-    return v;
-}
 
-// 0 = global_load, 1 = nontemporal (EXL3_SQ_STREAM), 2 = buffer_load (ISA §9).
-// BUFFER_LOAD wins if both env vars are set. Read once (captured graphs).
-static int exl3_sq_load_k()
-{
-    static const int v = []
-    {
-        const char* b = getenv("EXL3_SQ_BUFFER_LOAD");
-        if (b && atoi(b) == 1)
-        {
-            fprintf(stderr, "[sq-buffer] K=4 trellis: BUFFER_LOAD_B64 (texture L0, V# rsrc)\n");
-            return 2;
-        }
-        return exl3_sq_stream_b() ? 1 : 0;
-    }();
-    return v;
-}
 
 static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual)
 {
@@ -136,7 +103,7 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
         case 1: return exl3_gemv_int8_sq_sel_k1(M, c_fp32, residual);
         case 2: return exl3_gemv_int8_sq_sel_k2(M, c_fp32, residual);
         case 3: return exl3_gemv_int8_sq_sel_k3(M, c_fp32, residual);
-        case 4: return exl3_gemv_int8_sq_sel_k4(M, c_fp32, residual, exl3_sq_load_k());
+        case 4: return exl3_gemv_int8_sq_sel_k4(M, c_fp32, residual);
         case 5: return exl3_gemv_int8_sq_sel_k5(M, c_fp32, residual);
         case 6: return exl3_gemv_int8_sq_sel_k6(M, c_fp32, residual);
     }
@@ -150,7 +117,7 @@ static void* select_gemv_int8_msq_kernel(int K, bool c_fp32, bool residual)
         case 1: return exl3_gemv_int8_msq_sel_k1(c_fp32, residual);
         case 2: return exl3_gemv_int8_msq_sel_k2(c_fp32, residual);
         case 3: return exl3_gemv_int8_msq_sel_k3(c_fp32, residual);
-        case 4: return exl3_gemv_int8_msq_sel_k4(c_fp32, residual, exl3_sq_load_k());
+        case 4: return exl3_gemv_int8_msq_sel_k4(c_fp32, residual);
         case 5: return exl3_gemv_int8_msq_sel_k5(c_fp32, residual);
         case 6: return exl3_gemv_int8_msq_sel_k6(c_fp32, residual);
         case 7: return exl3_gemv_int8_msq_sel_k7(c_fp32, residual);
@@ -177,21 +144,6 @@ static int* gemv_int8_get_ws(int device, size_t ws_ints)
         ws.ws_ints = GEMV_INT8_WS_INTS;
     }
     return ws.ws;
-}
-
-// Unit routing override for the sq path (EXL3_SQ_STAGE_SMEM: 0 = narrow, 1 = smem-staged, unset =
-// the per-arch compile-time predicate). Diagnostic A/B knob for the RDNA staging question; the
-// non-default arms still reserve the same shared memory so the arm comparison stays like for like.
-// Read once per process, like the other kernel knobs here.
-static int exl3_sq_stage_arg()
-{
-    static const int v = []
-    {
-        const char* e = getenv("EXL3_SQ_STAGE_SMEM");
-        return e ? atoi(e) : -1;
-    }();
-    if (v < 0) return -1;
-    return v > 3 ? 3 : v;       // 0 = off, 1 = stage all K, 2 = stage K4, 3 = K4 narrow
 }
 
 // EXL3_SQ_GRID_MULT scales the occupancy-derived sq/msq grid (cap 8).
@@ -280,19 +232,7 @@ static bool exl3_gemv_int8_sq
     // default. CU-mode + MULT=2 + xor-16 (2026-09-23): 40 is 40.79 vs 48 at 40.59;
     // default 40 under -DEXL3_CUMODE (exl3_sq_rows_per_arg).
     int rows_per_arg = exl3_sq_rows_per_arg();
-    // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
-    // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
-    // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
-    // the column parallelism that wide-n shapes need. EXL3_SQ_ROWS_PER_NARROWN overrides
-    // rows_per for launches with size_n/256 < 48 (0 = off). In the msq path size_n is the bundle
-    // max width.
-    static const int rows_per_narrown = []
-    {
-        const char* e = getenv("EXL3_SQ_ROWS_PER_NARROWN");
-        return e ? atoi(e) : 0;
-    }();
-    if (rows_per_narrown > 0 && size_n / 256 < 48)
-        rows_per_arg = MAX((rows_per_narrown + 7) & ~7, SQ_MINROWS);
+
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -308,12 +248,9 @@ static bool exl3_gemv_int8_sq
             rows_per = MIN(rows_per_arg, MIN(rows_max, (rows_total + 7) & ~7));
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
     };
-    const int stage_arg = exl3_sq_stage_arg();
     auto smem_for = [&] (int rows_per) -> size_t
     {
-        // Reserve the B-stage region whenever either the compile-time routing or the override can
-        // use it, so the smem allocation (and therefore the occupancy) does not depend on the arm
-        size_t stage = gemv_int8_reserve_stage(K, stage_arg) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
         return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
                + stage + (size_t) 2 * M * 128 * 4;
     };
@@ -370,8 +307,7 @@ static bool exl3_gemv_int8_sq
         (void*) &suh_ptr,
         (void*) &A_had_ptr,
         (void*) &svh_ptr,
-        (void*) &rows_per_arg,
-        (void*) &stage_arg
+        (void*) &rows_per_arg
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
@@ -443,19 +379,6 @@ bool exl3_gemv_int8_msq
     // Mirror of the kernel's work decomposition (sq's single-wave rule over the max width);
     // EXL3_SQ_ROWS_PER pins the slice height (ROCm default 32 — see sq path comment above)
     int rows_per_arg = exl3_sq_rows_per_arg();
-    // A18: narrow shapes pay per-slice fixed costs (slice staging + epilogue combine) once per
-    // unit, so at the global rows_per=32 a k=17408/n=5120 matrix splits into 34 slices x 20
-    // column groups = 680 small units. A taller slice shrinks the slice count without shrinking
-    // the column parallelism that wide-n shapes need. EXL3_SQ_ROWS_PER_NARROWN overrides
-    // rows_per for launches with size_n/256 < 48 (0 = off). In the msq path size_n is the bundle
-    // max width.
-    static const int rows_per_narrown = []
-    {
-        const char* e = getenv("EXL3_SQ_ROWS_PER_NARROWN");
-        return e ? atoi(e) : 0;
-    }();
-    if (rows_per_narrown > 0 && size_n / 256 < 48)
-        rows_per_arg = MAX((rows_per_narrown + 7) & ~7, SQ_MINROWS);
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
     {
         int r = CEIL_DIVIDE(rows_total * nb256_max, grid_);

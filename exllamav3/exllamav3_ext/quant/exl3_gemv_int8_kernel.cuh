@@ -378,63 +378,12 @@ __device__ __forceinline__ void gemv_int8_row_sums
 // the generator end-to-end twice, against two clean runs at the default depth - so the pipeline
 // depth is not the wide unit's limiter and the change was dropped. Do not reintroduce it without
 // a hang-free end-to-end run.
-// K=4 trellis load with SLC (L2 streaming) and DLC (MALL no-allocate).
-__device__ __forceinline__ uint2 exl3_ld64_stream(const void* p)
-{
-#if defined(USE_ROCM)
-    // HIP uint2 is a struct; the builtin needs an ext_vector_type and then
-    // emits `global_load_b64 … slc dlc` on sq (ISA §4.1.1). LLVM tracks this
-    // load (no dest-copy race) but still waits vmcnt(0) at consume because
-    // r0=r1 / r1=r2 reuse those VGPRs. msq uses saddr addressing and LLVM
-    // drops the nontemporal bits there. gfx1100 4096/256: EXL3_SQ_STREAM=1
-    // was 35.36 vs DPP-only 35.40 (noise); leave the knob default off.
-    using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
-    u32x2 v = __builtin_nontemporal_load(reinterpret_cast<const u32x2*>(p));
-    uint2 out;
-    out.x = v.x;
-    out.y = v.y;
-    return out;
-#else
-    return *reinterpret_cast<const uint2*>(p);
-#endif
-}
-
-// ISA §9 / §16.16 BUFFER_LOAD_B64: texture-cache L0 path, VGPR byte offset against a
-// uniform 128-bit V# (make_buffer_rsrc). Distinct from global_load (vector L0).
-// flags 0x31004000 = raw 32-bit format (gfx10+). voffset is bytes from B's base.
-#if defined(USE_ROCM)
-using exl3_buf_rsrc_t = decltype(__builtin_amdgcn_make_buffer_rsrc((void*) nullptr, (short) 0, 0, 0));
-#endif
-
-__device__ __forceinline__ uint2 exl3_ld64_buffer(
-#if defined(USE_ROCM)
-    exl3_buf_rsrc_t rsrc,
-#else
-    void* rsrc,
-#endif
-    const void* base, const void* p)
-{
-#if defined(USE_ROCM)
-    using v2i = int __attribute__((ext_vector_type(2)));
-    int off = (int) ((const char*) p - (const char*) base);
-    // AMD clang 23: raw_buffer_load_b64(rsrc, voffset, soffset, aux). ISA §9 BUFFER_LOAD_B64.
-    v2i v = __builtin_amdgcn_raw_buffer_load_b64(rsrc, off, 0, 0);
-    uint2 out;
-    out.x = (uint32_t) v[0];
-    out.y = (uint32_t) v[1];
-    return out;
-#else
-    (void) rsrc; (void) base;
-    return *reinterpret_cast<const uint2*>(p);
-#endif
-}
-
 // DPP16 ROW_RR:1 (dpp_ctrl 0x121): rotate right by 1 within each 16-lane group.
 // Same permutation as __shfl_sync(v, (lane & 16) | ((lane + 15) & 15)), but it
 // stays on the VALU. The shuffle lowers to ds_bpermute_b32 and competes with
 // the splat ds_loads. ISA §7.7.1. Bit-identical on gfx1100 (256-thread check).
 // goal-isa vs goal-b2, Qwen3.8-27B-3.5bpw 4096/256: 35.40 vs 34.74 tok/s
-// (+1.9%), greedy-identical. Always on for ROCm; not behind EXL3_SQ_STREAM.
+// (+1.9%), greedy-identical. Always on for ROCm.
 __device__ __forceinline__ uint32_t exl3_row_ror1(uint32_t v)
 {
 #if defined(USE_ROCM)
@@ -445,7 +394,7 @@ __device__ __forceinline__ uint32_t exl3_row_ror1(uint32_t v)
 #endif
 }
 
-template <int M, bool residual, bool atomic = true, int load_k = 0>
+template <int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_wide
 (
     const uint16_t* __restrict__ B,
@@ -467,12 +416,7 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     const int row_stride = size_n * 2;                              // u32 per block row at 4 bpw
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * 64 + 2 * lane;
     int c2 = (lane & 1) ? 4 : 0;
-#if defined(USE_ROCM)
-    exl3_buf_rsrc_t b_rsrc;
-    if constexpr (load_k == 2)
-        b_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-            const_cast<uint16_t*>(B), (short) 0, (int) 0xffffffff, 0x31004000);
-#endif
+
     int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
     int kb = 0;
     auto consume_row = [&](uint2 row) {
@@ -538,16 +482,7 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     // DRAM sector/TLB throughput is the wall, not per-warp MLP. Keep depth 2.
     auto ld64 = [&](const uint32_t* np) -> uint2
     {
-        if constexpr (load_k == 2)
-        {
-#if defined(USE_ROCM)
-            return exl3_ld64_buffer(b_rsrc, B, np);
-#else
-            return *(const uint2*) np;
-#endif
-        }
-        else if constexpr (load_k == 1) return exl3_ld64_stream(np);
-        else return *(const uint2*) np;
+        return *(const uint2*) np;
     };
     uint2 r0 = ld64(bp);
     uint2 r1 = {};
@@ -861,17 +796,12 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 }
 
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
-// are at the ALU floor / DRAM-bound, wide covers 4). That measurement is Ampere, never RDNA:
-// EXL3_SQ_STAGE_SMEM forces the sq kernel's choice per process for an A/B (0 = narrow, 1 = smem,
-// unset = this predicate). The B-stage region is reserved whenever either the compile-time routing
-// or an override can use it, so an arm that forces smem on keeps the same shared-memory allocation
-// as the arm that forces it on by default (-1 = compile-time routing).
+// are at the ALU floor / DRAM-bound, wide covers 4). That measurement is Ampere; on gfx1100 the
+// narrow unit wins everywhere (measured +2.5% e2e decode, 2026-09-17), so ROCm routes all K to it
+// and does not reserve the B-stage region.
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
 #if defined(USE_ROCM)
-    // gfx1100 e2e (Qwen3.8-27B-3.5bpw, 4096/256, 2026-09-17): EXL3_SQ_STAGE_SMEM=0 moved decode
-    // from 31.02 to 31.79 tok/s (+2.5%) with token parity. Prefer narrow; do not reserve the
-    // unused B-stage region either (frees LDS → occupancy). Override with EXL3_SQ_STAGE_SMEM=1.
     (void) bits;
     return false;
 #else
@@ -879,10 +809,6 @@ __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 #endif
 }
 
-__host__ __device__ constexpr bool gemv_int8_reserve_stage(int bits, int stage_arg)
-{
-    return gemv_int8_stage_smem(bits) || stage_arg == 1 || (stage_arg >= 2 && bits == 4);
-}
 
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
 // striped over all warps of the grid. sh_tmp: 128 floats per warp.
@@ -1143,7 +1069,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 }
 #endif
 
-template <int bits, int M, bool c_fp32, bool residual, int load_k = 0>
+template <int bits, int M, bool c_fp32, bool residual>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
@@ -1157,8 +1083,7 @@ void exl3_gemv_int8_sq_kernel
     const half* __restrict__ suh,
     half* __restrict__ A_had,
     const half* __restrict__ svh,
-    const int rows_per_arg,     // 0 = auto (single-wave rule); >0 = fixed slice height
-    const int stage_arg         // -1 = per-arch unit routing, 0 = force narrow, 1 = force smem
+    const int rows_per_arg      // 0 = auto (single-wave rule); >0 = fixed slice height
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -1191,12 +1116,9 @@ void exl3_gemv_int8_sq_kernel
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
     // Mirrors the host's smem_for(): the stage region is where the host reserved it
-    float* sh_tmp = (float*) (sh_b + (gemv_int8_reserve_stage(bits, stage_arg) ? GEMV_STAGE_D * 8 * 16 * bits : 0));
-    // stage_arg: -1 = per-arch routing; 0 = arch routing with staging off (wide K4, narrow else);
-    // 1 = stage every K; 2 = stage K4 only; 3 = K4 through the generic narrow unit (A17 - the
-    // narrow unit already out-streams the wide one on the same-size K=3 shapes: 566 vs 463 GB/s)
-    bool use_smem = stage_arg < 0 ? gemv_int8_stage_smem(bits)
-                                  : (stage_arg == 1 || (stage_arg == 2 && bits == 4));
+    constexpr bool stage_b = gemv_int8_stage_smem(bits);
+    float* sh_tmp = (float*) (sh_b + (stage_b ? GEMV_STAGE_D * 8 * 16 * bits : 0));
+    bool use_smem = stage_b;
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1219,10 +1141,8 @@ void exl3_gemv_int8_sq_kernel
         {
             if (use_smem)
                 gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
-            else if (stage_arg == 3)
-                gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
             else
-                gemv_int8_unit_wide<M, residual, false, load_k>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
+                gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
         }
         else if (use_smem)
             gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
@@ -1256,7 +1176,7 @@ void exl3_gemv_int8_sq_kernel
 // size_n is the max slice/matrix width (mgemm convention) and pstride is padded to it, so slice
 // widths only need to be multiples of 128 - tail warps/128-spans exit on the n_j bound.
 
-template <int bits, bool c_fp32, bool residual, int load_k = 0>
+template <int bits, bool c_fp32, bool residual>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_msq_kernel
 (
@@ -1356,7 +1276,7 @@ void exl3_gemv_int8_msq_kernel
             int* pacc = partials + (size_t) key * pstride;
             const uint16_t* B_j = B_list[j_r];
             if constexpr (bits == 4)
-                gemv_int8_unit_wide<1, residual, false, load_k>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
+                gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
             else if constexpr (gemv_int8_stage_smem(bits))
                 gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, n_j);
             else
@@ -1414,7 +1334,7 @@ void exl3_gemv_int8_msq_kernel
         int n_stride_j = n_stride_list ? n_stride_list[j] : n_j;
         int* pacc = partials + (size_t) key * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<1, residual, false, load_k>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
+            gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
         else if constexpr (gemv_int8_stage_smem(bits))
             gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_stride_j, n_j);
         else

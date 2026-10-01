@@ -38,7 +38,16 @@ static bool hgemm_f16out_enabled()
     static const bool on = []
     {
         const char* e = getenv("EXL3_HGEMM_F16OUT");
+#if defined(USE_ROCM)
+        // Measured win on RDNA3 (hipBLAS fp32-out GEMM runs ~5x slower than fp16-out);
+        // the fp16 slab rounds each output once to fp16, the precision the residual
+        // stream already carries.
         return e ? atoi(e) != 0 : true;
+#else
+        // On CUDA the fp32-output path is not known to be slow; keep the exact path
+        // unless asked.
+        return e ? atoi(e) != 0 : false;
+#endif
     }();
     return on;
 }

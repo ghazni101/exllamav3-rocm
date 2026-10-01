@@ -29,10 +29,7 @@ if is_hip:
     # accepted. -ffast-math is the closest equivalent of --use_fast_math. gfx10/gfx11
     # targets execute in wave32 by default, matching the 32-lane assumptions in the kernels.
     extra_cuda_cflags = ["-O3", "-ffast-math", "-DHIPBLAS_USE_HIP_HALF"]
-    if os.environ.get("EXL3_WMMA") == "1":
-        # Opt-in hardware WMMA for the paired m16n16k16 MMA on gfx11. Off by
-        # default: the path has a known NaN bug on M>=3 GEMM shapes.
-        extra_cuda_cflags += ["-DEXL3_WMMA"]
+
     if os.environ.get("EXL3_CUMODE") == "1":
         # gfx11 default is WGP (2 CUs). CU mode schedules each 256-thread GEMV
         # block on one CU, doubling the number of independent workgroup slots

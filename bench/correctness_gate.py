@@ -11,10 +11,9 @@ Modes:
                         capture the first NUMCHECK_STEPS generated-step logits (full
                         vocab) per prompt. save: store to path (torch.save). compare:
                         KLD(ref || new) per prompt must be < NUMCHECK_KLD (1e-3) - the
-                        gate for changes that intentionally alter numerics (plan §6.1,
-                        findings-log §10.4.2); token divergence vs the reference run is
-                        reported per prompt. Capture the reference on the incumbent
-                        numerics (e.g. EXL3_INT8_MSQ=0) in the same image.
+                        gate for changes that intentionally alter numerics; token
+                        divergence vs the reference run is reported per prompt. Capture
+                        the reference on the incumbent numerics in the same image.
 
 Greedy decoding is deterministic: any numeric change (grid size, reduction order,
 tiling) shows up as divergent token ids long before it is visible as loss.
