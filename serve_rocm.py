@@ -45,17 +45,63 @@ class QueueFull(Exception):
     pass
 
 
+# Driver watchdog: gen.iterate() can wedge INSIDE a call (a kernel deadlocking
+# on-device spins the GPU at 100% while the driver busy-polls the synchronize in
+# userspace - no exception ever fires, so the exception containment below never
+# sees it, health stays green, and every request hangs forever). The driver
+# stamps a heartbeat around each iterate(); a watchdog thread fails the server
+# when jobs are waiting but no progress is made for EXL3_DRIVER_STALL_S.
+# Recovery is a process exit (docker restarts us); a wedged kernel only dies
+# with its process.
+DRIVER_STALL_S = float(os.environ.get("EXL3_DRIVER_STALL_S", "120"))
+_driver_heartbeat = [0.0]   # time of last progress (iterate returned or wait began)
+
+
+def _fail_driver(reason: str):
+    if "driver_error" in state:
+        return
+    traceback.print_exc()
+    state["driver_error"] = reason
+    print(f"[serve] DRIVER WATCHDOG: {reason}", flush=True)
+    with _lock:
+        for serial, q in list(_job_queues.items()):
+            q.put({"serial": serial, "stage": "error", "eos": True,
+                   "error": f"driver stalled: {reason}"})
+        _job_queues.clear()
+    # Leave the process so the container restart policy brings up a clean GPU
+    # context; linger briefly so the error results are drained by waiters.
+    threading.Timer(5.0, lambda: os._exit(1)).start()
+
+
+def _watchdog_loop():
+    while "driver_error" not in state:
+        time.sleep(5)
+        if time.time() - _driver_heartbeat[0] < DRIVER_STALL_S:
+            continue
+        with _lock:
+            waiting = len(_job_queues)
+        if waiting:
+            _fail_driver(
+                f"no driver progress for {DRIVER_STALL_S:.0f}s with {waiting} job(s) "
+                f"waiting - wedged kernel suspected")
+
+
 def _driver_loop():
+    _driver_heartbeat[0] = time.time()
     while True:
         gen = state.get("generator")
         if gen is None:
             time.sleep(0.1)
+            _driver_heartbeat[0] = time.time()
             continue
         try:
             with _gen_cv:
                 while gen.num_remaining_jobs() == 0:
+                    _driver_heartbeat[0] = time.time()
                     _gen_cv.wait()
+                _driver_heartbeat[0] = time.time()
                 results = gen.iterate()
+                _driver_heartbeat[0] = time.time()
         except Exception as e:
             # One escaped exception (e.g. a sticky HIP error after an OOM) used to
             # kill this thread silently: every in-flight request hung forever while
@@ -63,13 +109,7 @@ def _driver_loop():
             # registered waiter, mark the driver dead (visible in /health), stop.
             # Recovery is a process restart; auto-retrying against a faulted
             # context would just hang the GPU.
-            traceback.print_exc()
-            state["driver_error"] = f"{type(e).__name__}: {e}"
-            with _lock:
-                for serial, q in list(_job_queues.items()):
-                    q.put({"serial": serial, "stage": "error", "eos": True,
-                           "error": f"driver loop died: {e}"})
-                _job_queues.clear()
+            _fail_driver(f"{type(e).__name__}: {e}")
             return
         for r in results:
             q = _job_queues.get(r.get("serial"))
@@ -127,6 +167,7 @@ def load_model():
     state["load_s"] = time.time() - t0
     print(f"[serve] model loaded in {state['load_s']:.1f}s", flush=True)
     threading.Thread(target=_driver_loop, daemon=True).start()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
 class GenReq(BaseModel):
