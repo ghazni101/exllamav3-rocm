@@ -226,6 +226,9 @@ class SWALayerState:
         a = max(0, b - self.module.sliding_window)
         # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
         # stalls the host mid-prefill.
+# Contract: the returned pinned tensors are filled by an async D2H on the current
+        # stream. They are only safe for stream-ordered consumers (unstash re-uploads on
+        # the same stream); host-side readers must synchronize the stream first.
         k = torch.empty_like(self.k_state[slot, a:b], device = "cpu", pin_memory = True)
         v = torch.empty_like(self.v_state[slot, a:b], device = "cpu", pin_memory = True)
         k.copy_(self.k_state[slot, a:b], non_blocking = True)

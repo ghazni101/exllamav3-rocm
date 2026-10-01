@@ -1068,6 +1068,34 @@ def _paged_attn_decode_combine_kernel(
 
 _decode_sm_count = {}
 
+# EXL3_ATTN_CANARY: 0 off (default), 1 warn once per process on degenerate output,
+# 2 also raise. Motivated by the 2026-10-01 review: one transient suite run produced
+# all-zero prefill output for every test in test_triton_paged_hdpad.py (rel err 1.0,
+# never reproduced in 6 later attempts). Softmax output is a convex combination of V
+# rows, so a whole all-zero output batch means the kernel computed against zeroed
+# inputs - the signature of a launcher/arg-staging race, not of bad math.
+_attn_canary = int(os.environ.get("EXL3_ATTN_CANARY", "0") or "0")
+_canary_warned = False
+
+def _attn_output_canary(tag: str, out: torch.Tensor, q: torch.Tensor):
+    global _canary_warned
+    if _attn_canary == 0:
+        return
+    o = out.float()
+    if not torch.isfinite(o).all():
+        raise RuntimeError(f"paged_attn_{tag}: non-finite output "
+                           f"(q norm {q.float().norm():.3e})")
+    dead = (o.abs().amax(dim=tuple(range(1, o.ndim))) == 0)
+    if bool(dead.any()):
+        msg = (f"paged_attn_{tag}: {int(dead.sum())}/{dead.numel()} all-zero rows "
+               f"(q norm {q.float().norm():.3e})")
+        if _attn_canary >= 2:
+            raise RuntimeError(msg)
+        if not _canary_warned:
+            print(f"[attn-canary] WARNING: {msg}", flush=True)
+            _canary_warned = True
+
+
 
 
 def paged_attn_triton_decode(
@@ -1211,6 +1239,7 @@ def paged_attn_triton_decode(
                 block_m, block_h, block_rows,
                 num_warps=4, num_stages=1,
             )
+    _attn_output_canary("decode", out, q)
     return out
 
 
@@ -1930,6 +1959,7 @@ def paged_attn_triton_prefill(
                 num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
                 num_warps=8, num_stages=1,
             )
+    _attn_output_canary("prefill", out, q)
     return out
 
 

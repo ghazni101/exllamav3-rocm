@@ -9,9 +9,10 @@ time. Either way, set them before loading a model.
 
 ## Attention
 
-### `EXL3_BC_ATTN` (default: `1`)
+### `EXL3_BC_ATTN` (default: `1`, `0` on ROCm/HIP)
 
-Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
+Graph-captured C++ decode attention (on gfx1100 the captured block replays ~3.5%
+slower than eager dispatch, so the default there is off). For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
 block -- q/k/v projections, fused head norm + RoPE, cache append, flash-decoding attention and
 o_proj -- runs as a single C++ call, captured as one CUDA graph per (bsz, q_len) shape and
 replayed with only the input/output/position/block-table pointers patched. Removes effectively
@@ -156,7 +157,9 @@ only under `-DEXL3_CUMODE`.
 
 ### `EXL3_CUMODE` (build-time, default: off)
 
-Set to `1` at compile (`setup.py` → hipcc `-mcumode -DEXL3_CUMODE`). gfx11
+Recognized only as the exact string `1` (an exception to the boolean convention
+above; `true`/`yes` silently build WGP mode). Set at compile
+(`setup.py` → hipcc `-mcumode -DEXL3_CUMODE`). gfx11
 default is WGP (2 CUs per WGP; ROCm reports 48 SMs on a 96-CU 7900 XTX).
 CU mode pins each workgroup to one CU. Pair with `EXL3_SQ_GRID_MULT=2`
 (compile default under `-DEXL3_CUMODE`): MULT=1 is 33.88, MULT=2 is 38.36.
@@ -180,12 +183,14 @@ variant ~5x slower, so this is on by default there (+60-73% on 2k-token prefill;
 fp16 rounding matches the precision the residual stream already carries). `0` restores the
 exact fp32-output path.
 
-### `EXL3_RECONSTRUCT_THRESHOLD` (default: `144`)
+### `EXL3_RECONSTRUCT_THRESHOLD` (default: `144`; serving sets `16`)
 
 Row-count crossover between the int8 GEMV decode path and reconstruct+BLAS for EXL3
 projections. 144 is the NVIDIA-tuned default; on RDNA3 the GEMV path tops out around
-~56 tok/s while reconstruct is ~700 tok/s, so serving sets a lower threshold to keep
-chat-size prefills off the GEMV path.
+~56 tok/s while reconstruct is ~700 tok/s and the crossover is ~16 rows, so
+`serve_rocm.py`/`serve_openai.py` and the Dockerfile set `16` (before importing
+exllamav3; the value is read at import time) to keep chat-size prefills off the GEMV
+path. Set it explicitly to restore `144`.
 
 ### `EXL3_GDN_CHUNK_MIN` (default: `8`), `EXL3_GDN_BC_MAX_QLEN` (default: `8`)
 
@@ -208,7 +213,7 @@ GEMV launches. Diagnostic for launch-geometry A/Bs.
 ### `EXL3_INT8_GEMV_MAX_K` (default: per-arch)
 
 Highest bitrate K the int8 GEMV path accepts; above it the regular fp16 kernel runs instead.
-The default is 6 on Hopper and Blackwell and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
+The default is 6 on Hopper, Blackwell and RDNA3, and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
 where the int8 path's reduced per-weight compute no longer helps (and Ada is marginal there),
 but on Hopper the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced
 to test the crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
@@ -761,3 +766,27 @@ Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.
 off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
 on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
 choice also sizes the quantizer's scratch buffers.
+
+### `EXL3_ATTN_CANARY` (default: `0`; serve sets `1`)
+
+Validate triton paged-attention output: `1` warns (once per process) when a call
+produces all-zero rows - the signature of the transient launcher race documented
+in docs/rocm.md - and always raises on non-finite output; `2` also raises on
+zero rows. Off by default because the check synchronizes; serving enables warn
+mode.
+
+### `EXL3_MAX_QUEUE` (default: `32`)
+
+Serving backpressure: reject `/generate` and `/v1/*` requests with 503 once this
+many jobs are pending+active, instead of queueing without bound (each queued job
+holds prompt tensors and pinning memory; active jobs hold cache pages).
+
+### `EXL3_REQUEST_TIMEOUT_S` (default: `600`)
+
+Serving: `/generate` fails with 503 and cancels the job if no result arrives
+within this many seconds. Belt-and-braces against a wedged driver.
+
+### `EXL3_WARMUP_OPTIONAL` (default: `0`)
+
+`warmup_openai.py` exits nonzero when the server never becomes healthy or an
+HTTP error occurs; set `1` to downgrade those to warnings.

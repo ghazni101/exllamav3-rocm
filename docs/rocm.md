@@ -52,14 +52,68 @@ hardware WMMA MMA (`EXL3_WMMA`, NaN bug on M≥3), nontemporal/buffer K=4 loads
 `EXL3_SQ_ROWS_PER_NARROWN` overrides, attention splits/warps knobs, deeper GEMV
 row pipelines.
 
+## Batch-size-dependent decode numerics
+
+Decode output is **not bitwise identical across batch sizes** on this port, by
+design of the dispatch:
+
+- `m <= 4` rows take the int8 GEMV path (per-row quantized activations,
+  ~0.8% RMS quantization error) — the decode engine.
+- `m >= 5` rows take the fp16 reconstruct + GEMM path (~0.06% error) — the
+  int8 msq kernels decline above 4 rows on RDNA3.
+
+A near-tie logit can therefore flip one greedy token between an m=1 and an m=8
+run of the same prompt and fork the continuation; both branches remain
+individually coherent text (observed on prompt batch_c: "Blackwood Island" vs
+"Blackwood Point"). The fork position varies with the GEMM autotuner's
+per-session config choice (one-token flip in some sessions, a story-level fork
+in others — the autotuner times candidates at first use, so the winning config
+depends on GPU conditions at process start). CUDA has the same sq/msq split
+with different crossovers, so this is not ROCm-specific — but exact
+batch-invariance of greedy output is **not a contract** here. The `batch` gate
+encodes the policy instead: equal lengths, first fork no earlier than
+`GATE_BATCH_MINSTEP` generated tokens (default 4; earlier means prefill or
+first-step numerics differ materially). Totals beyond the fork are reported
+but not gated - two coherent continuations drift in and out of coincidental
+token agreement; the numeric gap itself is numcheck's job.
+`GATE_BATCH_STRICT=1` restores
+exact equality for A/B runs whose numerics should be batch-independent.
+Within a dispatch family the output *is* bitwise batch-independent (verified
+m=5..2048 on model tensors).
+
+Prefill numerics additionally differ from exact fp32 GEMM output when
+`EXL3_HGEMM_F16OUT=1` (default on ROCm): each fp32-output reconstruct GEMM
+result is rounded once to fp16, the precision the residual stream carries
+anyway. Measured worst model-level KLD for that rounding is 1.9e-3
+(vs 1e-3 gate default) — when A/B-ing across that default change, set
+`NUMCHECK_MAXDIV` and `NUMCHECK_KLD` accordingly, or compare like with like.
+
+## Known ROCm-open issue: transient all-zero triton prefill output
+
+2026-10-01: one full-suite run produced all-zero output from
+`paged_attn_triton_prefill` for every test in `test_triton_paged_hdpad.py`
+(rel err 1.0), including the power-of-two head-dim control; six later attempts
+(solo file warm/cold, full suite warm/cold/CPU-loaded, standalone repro) all
+pass. Signature — kernels run but compute against zeroed inputs across a whole
+test file — points at a transient launcher/arg-staging race in triton-rocm,
+not at kernel math. `EXL3_ATTN_CANARY=1` (warn) / `2` (raise) instruments the
+output for detection in serve/CI until this is pinned;
+`bench/stress_triton_prefill.py` is the hammer. If it reproduces, capture
+triton-rocm version and file upstream.
+
 ## Testing
 
 `bench/` holds the A/B harness:
 
 - `bench/bench.py` — decode/prefill/batch benchmark (model via `EXL3_MODEL`).
 - `bench/correctness_gate.py` — `baseline`/`compare` golden greedy-token parity,
-  `batch` sequential-vs-concurrent equivalence, `numcheck save|compare` logits KLD.
+  `batch` sequential-vs-concurrent equivalence (divergence policy above),
+  `numcheck save|compare` logits KLD (includes the long/prefill prompts by
+  default so `EXL3_HGEMM_F16OUT`-class changes are actually measured).
 - `bench/check_so_wgp_mode.py` — ELF `.workgroup_processor_mode` gate for
   `-mcumode` builds (used by Dockerfile.rocm).
+- `bench/fuzz_exl3_adversarial.py`, `bench/fuzz_hgemm_adversarial.py`,
+  `bench/stress_triton_prefill.py` — kernel-vs-reference fuzz and the triton
+  repro hammer (added by the 2026-10-01 review).
 
 Both run inside the image; mount a model and pass `-e EXL3_MODEL=…`.

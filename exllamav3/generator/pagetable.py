@@ -254,6 +254,18 @@ class Sequence:
     def build_block_index_tensor(self):
         # Pinned so get_for_device uploads it with a non-blocking copy; a
         # pageable tensor would serialize the stream at chunk boundaries.
+        #
+        # SINGLE buffer, deliberately. Two invariants make in-place updates safe:
+        # 1. Captured graphs replay the H2D memcpy from this fixed address (same
+        #    contract as multilinear's _c_ptrs_pin) - double-buffering breaks
+        #    replay (measured: batch gate batch_c diverged 98/144 tokens with
+        #    alternating buffers). 2. In-place rewrites between async uploads rely
+        #    on page indices being append-stable: existing pages keep their
+        #    indices when pages are appended (the common rebuild); a mid-list
+        #    page SWITCH (job.py's shared-reference dedup) rewrites a slot, which
+        #    is only safe because page hashing synchronizes with the GPU between
+        #    generator steps. If a rebuild ever rewrites slots without such a
+        #    sync, this needs event-guarding WITHOUT changing the address.
         n = len(self.allocated_pages)
         buf = self.__dict__.get("_block_index_pin")
         if buf is None or buf.shape[-1] < n:

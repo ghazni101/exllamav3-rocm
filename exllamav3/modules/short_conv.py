@@ -187,6 +187,9 @@ class ShortConvLayerState:
         cdim = self.module.conv_kernel_size
         # Pinned dst + non_blocking: see GDNLayerState.stash for why .cpu()
         # stalls the host mid-prefill.
+# Contract: the returned pinned tensors are filled by an async D2H on the current
+        # stream. They are only safe for stream-ordered consumers (unstash re-uploads on
+        # the same stream); host-side readers must synchronize the stream first.
         c = torch.empty_like(self.conv_state[slot, :, :cdim], device = "cpu", pin_memory = True)
         c.copy_(self.conv_state[slot, :, :cdim], non_blocking = True)
         return c

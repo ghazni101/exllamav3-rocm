@@ -287,6 +287,9 @@ class GDNLayerState:
         # allocator records a stream event on free(), so the buffer can't be
         # recycled before the copy lands, and unstash() re-uploads on the same
         # stream where ordering is already guaranteed.
+# Contract: the returned pinned tensors are filled by an async D2H on the current
+        # stream. They are only safe for stream-ordered consumers (unstash re-uploads on
+        # the same stream); host-side readers must synchronize the stream first.
         s = torch.empty_like(self.recurrent_state[slot, :1], device = "cpu", pin_memory = True)
         c = torch.empty_like(self.conv_state[slot, :, :cdim], device = "cpu", pin_memory = True)
         s.copy_(self.recurrent_state[slot, :1], non_blocking = True)
