@@ -25,6 +25,7 @@ from serve_rocm import (app, state, _lock, MODEL_DIR, submit_job, cancel_job,
 # chat then generated until EOS/cache, and thinking hid visible content for that
 # entire run. Cap the default; clients that want more send max_tokens explicitly.
 DEFAULT_MAX_NEW = min(int(os.environ.get("EXL3_MAX_NEW_TOKENS", "2048")), MAX_TOKENS)
+_THINK_FORCE = os.environ.get("EXL3_THINKING", "").strip().lower()
 from exllamav3 import Job
 from exllamav3.generator.sampler import ComboSampler, GreedySampler
 
@@ -111,6 +112,15 @@ def _template_kwargs(req: "ChatReq") -> dict:
     if req.tools and req.tool_choice != "none":
         kw["tools"] = [t.model_dump(exclude_none=True) for t in req.tools]
     kw.update(req.chat_template_kwargs or {})  # explicit kwargs win
+    # Operator override: this model can spend its entire completion budget
+    # reasoning (observed: 44 KB of <think> on one prompt without closing the
+    # tag), and chatty always requests an effort, so the override must beat the
+    # effort map. EXL3_THINKING=off forces the template's thinking off for every
+    # request; =on forces it on; unset keeps request-controlled behavior.
+    if _THINK_FORCE == "off":
+        kw["enable_thinking"] = False
+    elif _THINK_FORCE == "on":
+        kw["enable_thinking"] = True
     return kw
 
 
