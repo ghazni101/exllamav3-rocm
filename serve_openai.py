@@ -253,10 +253,12 @@ def _run_job(prompt_ids, max_new_tokens, sampler, stop_conds, seed, out_q, cance
             if r.get("eos"):
                 result = r
                 held = r.get("held") or {}
-                # Flush held-back tail text - except on a stop-token EOS, where the
-                # held buffer still contains the stop token's own text (emit_held
-                # stays False there precisely so it is not emitted)
-                if held.get("text") and result.get("eos_reason") != "stop_token":
+                # Flush held-back tail text only on a length stop (the healing tail
+                # of the last token, which would otherwise be truncated). Never on
+                # stop_token (held text contains the stop token itself) or
+                # stop_string (job.py sets held_text = rem_held_text, which starts
+                # with the stop string - OpenAI output excludes stop sequences).
+                if held.get("text") and result.get("eos_reason") == "max_new_tokens":
                     out_q.put(("text", held["text"]))
                 break
         if cancel_ev.is_set() and not result:

@@ -182,9 +182,10 @@ def generate(req: GenReq):
             if r.get("eos"):
                 result = r
                 held = r.get("held") or {}
-                # Same rule as serve_openai: flush held tail text except on a
-                # stop-token EOS, where held text includes the stop token itself
-                if held.get("text") and result.get("eos_reason") != "stop_token":
+                # Same rule as serve_openai: flush held tail text only on a length
+                # stop (healing tail); stop_token holds the stop token itself,
+                # stop_string's rem_held_text starts with the stop string
+                if held.get("text") and result.get("eos_reason") == "max_new_tokens":
                     chunks.append(held["text"])
                 break
     finally:
