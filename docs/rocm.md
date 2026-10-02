@@ -116,6 +116,20 @@ and prefill exits for detection in serve/CI until this is pinned. If it
 reproduces, capture triton-rocm version + the canary message and file upstream
 against triton-rocm.
 
+### Defense-in-depth: bounded paged indexing (2026-10-02)
+
+Every paged cache kernel that derives addresses from `block_table` /
+`cache_seqlens` now bounds-checks first: torn staging produces a skipped/clamped
+access instead of a wild VRAM write or read. Covers `quant_cache_paged_kernel`,
+`dequant_cache_paged_kernel` (+ window variant), `dspark_write_rows_kernel`,
+`paged_kv_update_vec8_kernel`, `kv_cache_update_kernel_paged` and the
+chunked-paged attention kernels (`paged_cache_offset` clamps both index levels),
+in both the CUDA and HIP sources; on the Triton side `_paged_kv_update_kernel`
+masks its store and the decode/prefill attention kernels clamp `phys` and
+`total_k_len` against the pool/table extents. A corrupted index now yields wrong
+but bounded output — tripped by `EXL3_ATTN_CANARY` — rather than silent cache or
+weight corruption.
+
 ## Testing
 
 `bench/` holds the A/B harness:
