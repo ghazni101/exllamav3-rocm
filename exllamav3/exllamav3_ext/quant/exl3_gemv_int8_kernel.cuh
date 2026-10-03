@@ -71,10 +71,10 @@ __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 
 // i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for
 // odd bit widths)
-template <int bits>
+template <int bits, bool HALF = false>
 __device__ __forceinline__ int wrap_idx(int i)
 {
-    constexpr int words = bits * 256 / 32;
+    constexpr int words = HALF ? 4 * (2 * bits + 1) : bits * 256 / 32;
     return i >= words ? i - words : i;
 }
 
@@ -109,7 +109,35 @@ __device__ __forceinline__ void ext2w(const uint32_t* ptr, int t0, uint32_t& w0,
     w0 = fshift(b, a, s2 + bits) & 0xffff;
 }
 
-template <int bits>
+// Half-integer rate bits + 0.5: same two-group extraction as dq8_half (exl3_dq.cuh), 18 + 3 * bits
+// bits spanned per group of four 16-bit windows; two groups per eight-window tile
+template <int KA>
+__device__ __forceinline__ void ext8w_half
+(
+    const uint32_t* ptr, int t0,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
+)
+{
+    constexpr int bits2 = 2 * KA + 1;
+    constexpr int gspan = 18 + 3 * KA;
+    const int e7 = ((t0 >> 1) + 4) * bits2 + 128 * bits2;
+    const int e3 = e7 - 2 * bits2;
+    {
+        int hi = (e7 - 1) / 32, lo = (e7 - gspan) / 32, s = (hi + 1) * 32 - e7;
+        uint32_t a = ptr[wrap_idx<KA, true>(lo)], b = ptr[wrap_idx<KA, true>(hi)];
+        w7 = fshift(b, a, s); w6 = w7 >> (KA + 1); w5 = w6 >> KA; w4 = w5 >> (KA + 1);
+    }
+    {
+        int hi = (e3 - 1) / 32, lo = (e3 - gspan) / 32, s = (hi + 1) * 32 - e3;
+        uint32_t a = ptr[wrap_idx<KA, true>(lo)], b = ptr[wrap_idx<KA, true>(hi)];
+        w3 = fshift(b, a, s); w2 = w3 >> (KA + 1); w1 = w2 >> KA; w0 = w1 >> (KA + 1);
+    }
+    w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
+    w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
+}
+
+template <int bits, bool HALF = false>
 __device__ __forceinline__ void ext8w
 (
     const uint32_t* ptr, int t0,
@@ -117,7 +145,11 @@ __device__ __forceinline__ void ext8w
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    if constexpr (bits == 1)
+    if constexpr (HALF)
+    {
+        ext8w_half<bits>(ptr, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    }
+    else if constexpr (bits == 1)
     {
         uint32_t i1 = t0 >> 5;
         uint32_t i0 = (i1 + 7) & 7;
@@ -540,9 +572,14 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     }
 }
 
+// Words (uint32) per 16x16 tile: 8 * bits, or 4 * (2 * bits + 1) at the half-integer rate bits + 0.5
+// (16 * bits + 8 uint16, mul1 codebook only)
+template <int bits, bool HALF>
+__host__ __device__ constexpr int gemv_int8_twords() { return HALF ? 4 * (2 * bits + 1) : 8 * bits; }
+
 // One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks from block pointers
 // (global or shared memory), M rows sharing the extraction
-template <int bits, int M, bool residual>
+template <int bits, int M, bool residual, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_pair_row
 (
     const uint32_t* blockA, const uint32_t* blockB,
@@ -553,7 +590,7 @@ __device__ __forceinline__ void gemv_int8_pair_row
 )
 {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-    ext8w<bits>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    ext8w<bits, HALF>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
     #pragma unroll
@@ -586,7 +623,7 @@ __device__ __forceinline__ void gemv_int8_pair_row
         }
     }
 
-    ext8w<bits>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    ext8w<bits, HALF>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
     #pragma unroll
@@ -697,7 +734,7 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 // hurt more than they hid latency. Register prefetch of the ext8w source words tried
 // again (bits 3/5/6/8, 2026-09-30): 39.42 vs 41.36 (-4.7%) canonical 4096/256 —
 // also rejected; leave the unit as pure sequential extract.
-template <int bits, int M, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_unit_narrow
 (
     const uint16_t* __restrict__ B,
@@ -716,8 +753,9 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
     if (nbp * 32 >= ncols) return;      // warp-uniform: whole 32-column pair past the slice end
-    const int row_stride = size_n * bits / 2;
-    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
+    constexpr int TWORDS = gemv_int8_twords<bits, HALF>();
+    const int row_stride = size_n / 16 * TWORDS;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (2 * TWORDS);
     int c2 = 2 * (lane & 3);
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
@@ -725,7 +763,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     for (int kb = 0; kb < nrows; ++kb)
     {
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual, HALF>(blockA, blockA + TWORDS,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -740,7 +778,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
 // extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
 // load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
-template <int bits, int M, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_unit_smem
 (
     const uint16_t* __restrict__ B,
@@ -757,13 +795,14 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 )
 {
     constexpr int D = GEMV_STAGE_D;
-    constexpr int pairwords = 16 * bits;
+    constexpr int TWORDS = gemv_int8_twords<bits, HALF>();
+    constexpr int pairwords = 2 * TWORDS;
     constexpr int chunks = pairwords / 4;      // 16 B cp.async chunks per pair row
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
     if (nbp * 32 >= ncols) return;      // warp-uniform: whole 32-column pair past the slice end
-    const int row_stride = size_n * bits / 2;
+    const int row_stride = size_n / 16 * TWORDS;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
@@ -788,7 +827,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem
         stage_row(kb + D - 1);
 
         const uint32_t* blockA = sb + (kb % D) * pairwords;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual, HALF>(blockA, blockA + TWORDS,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -799,13 +838,13 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 // are at the ALU floor / DRAM-bound, wide covers 4). That measurement is Ampere; on gfx1100 the
 // narrow unit wins everywhere (measured +2.5% e2e decode, 2026-09-17), so ROCm routes all K to it
 // and does not reserve the B-stage region.
-__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
+__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits, bool half = false)
 {
 #if defined(USE_ROCM)
-    (void) bits;
+    (void) bits; (void) half;
     return false;
 #else
-    return bits == 3 || bits == 5 || bits == 7;
+    return half || bits == 3 || bits == 5 || bits == 7;
 #endif
 }
 
@@ -1069,7 +1108,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 }
 #endif
 
-template <int bits, int M, bool c_fp32, bool residual>
+template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
@@ -1116,8 +1155,9 @@ void exl3_gemv_int8_sq_kernel
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
     // Mirrors the host's smem_for(): the stage region is where the host reserved it
-    constexpr bool stage_b = gemv_int8_stage_smem(bits);
-    float* sh_tmp = (float*) (sh_b + (stage_b ? GEMV_STAGE_D * 8 * 16 * bits : 0));
+    constexpr bool stage_b = gemv_int8_stage_smem(bits, HALF);
+    constexpr int STAGE_WORDS = 2 * gemv_int8_twords<bits, HALF>();   // uint32 per pair row per warp
+    float* sh_tmp = (float*) (sh_b + (stage_b ? GEMV_STAGE_D * 8 * STAGE_WORDS : 0));
     bool use_smem = stage_b;
     __shared__ float sh_red[33];
     __shared__ int sh_last;
@@ -1137,17 +1177,17 @@ void exl3_gemv_int8_sq_kernel
             prev_slice = slice;
         }
         int* pacc = partials + (size_t) slice * M * pstride;
-        if constexpr (bits == 4)
+        if constexpr (bits == 4 && !HALF)
         {
             if (use_smem)
-                gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
+                gemv_int8_unit_smem<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
             else
                 gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
         }
         else if (use_smem)
-            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, size_n);
         else
-            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
@@ -1176,7 +1216,7 @@ void exl3_gemv_int8_sq_kernel
 // size_n is the max slice/matrix width (mgemm convention) and pstride is padded to it, so slice
 // widths only need to be multiples of 128 - tail warps/128-spans exit on the n_j bound.
 
-template <int bits, bool c_fp32, bool residual>
+template <int bits, bool c_fp32, bool residual, bool HALF = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_msq_kernel
 (
@@ -1231,7 +1271,7 @@ void exl3_gemv_int8_msq_kernel
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * (residual ? 2 : 1);
-    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits, HALF) ? 8 * GEMV_STAGE_D * (2 * gemv_int8_twords<bits, HALF>()) : 0));
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1275,12 +1315,12 @@ void exl3_gemv_int8_msq_kernel
 
             int* pacc = partials + (size_t) key * pstride;
             const uint16_t* B_j = B_list[j_r];
-            if constexpr (bits == 4)
+            if constexpr (bits == 4 && !HALF)
                 gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
-            else if constexpr (gemv_int8_stage_smem(bits))
-                gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, n_j);
+            else if constexpr (gemv_int8_stage_smem(bits, HALF))
+                gemv_int8_unit_smem<bits, 1, residual, false, HALF>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n, n_j);
             else
-                gemv_int8_unit_narrow<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
+                gemv_int8_unit_narrow<bits, 1, residual, false, HALF>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n, n_j);
 
             __threadfence();
             __syncthreads();
@@ -1333,12 +1373,12 @@ void exl3_gemv_int8_msq_kernel
         const uint16_t* B_j = B_list[j];
         int n_stride_j = n_stride_list ? n_stride_list[j] : n_j;
         int* pacc = partials + (size_t) key * pstride;
-        if constexpr (bits == 4)
+        if constexpr (bits == 4 && !HALF)
             gemv_int8_unit_wide<1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
-        else if constexpr (gemv_int8_stage_smem(bits))
-            gemv_int8_unit_smem<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_stride_j, n_j);
+        else if constexpr (gemv_int8_stage_smem(bits, HALF))
+            gemv_int8_unit_smem<bits, 1, residual, false, HALF>(B_j, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_stride_j, n_j);
         else
-            gemv_int8_unit_narrow<bits, 1, residual, false>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
+            gemv_int8_unit_narrow<bits, 1, residual, false, HALF>(B_j, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_stride_j, n_j);
 
         // Per-(matrix,row) completion counter: the ksplit-th contributor runs the epilogue for
         // this 256-column group of output row `row` of matrix j
@@ -1369,7 +1409,7 @@ void exl3_gemv_int8_msq_kernel
 // ---------------------------------------------------------------------------------------------------------
 // Cooperative kernel: same argument list as exl3_gemm_kernel
 
-template <int bits, bool c_fp32, bool residual>
+template <int bits, bool c_fp32, bool residual, bool HALF = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_coop_kernel
 (
@@ -1531,12 +1571,12 @@ void exl3_gemv_int8_coop_kernel
                 gemv_int8_stage_splats<residual>(Ar, q_row, sh_as, sh_as2, kb0, nrows);
                 prev_slice = slice;
             }
-            if constexpr (bits == 4)
+            if constexpr (bits == 4 && !HALF)
                 gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
-            else if constexpr (gemv_int8_stage_smem(bits))
-                gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n, size_n);
+            else if constexpr (gemv_int8_stage_smem(bits, HALF))
+                gemv_int8_unit_smem<bits, 1, residual, true, HALF>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n, size_n);
             else
-                gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
+                gemv_int8_unit_narrow<bits, 1, residual, true, HALF>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n, size_n);
         }
         grid.sync();
 

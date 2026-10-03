@@ -193,10 +193,9 @@ int exl3_gemm_gr
 
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
-    // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
-    // to the regular kernel. Half-integer bitrates (16 * K + 8 uint16 per tile) are not supported by
-    // this path on ROCm and take the fp16 GEMM below, which carries the half-rate instances.
-    if (mul1 && !half_k && exl3_gemv_int8_enabled())
+    // threshold keeps m <= 144 in practice). The sq/coop int8 kernels carry the half-integer rates
+    // (16 * K + 8 uint16 per tile) for K = 1.5 / 2.5 / 3.5 too, so no rate gate is needed here.
+    if (mul1 && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, force_num_sms, stream, graph))
             return 0;
@@ -559,7 +558,8 @@ int exl3_mgemm_gr
     // Multi-matrix/sliced fast path: one regular launch covers the whole call (sliced
     // SlicedMultiLinear bundles and plain multi-matrix projections), any m - rows are flattened
     // into the unit index. No filtering/reduction; MoE-style per-matrix inputs (bszm_in > 1)
-    // stay on the coop kernel.
+    // stay on the coop kernel. Half-integer rates are excluded here (the sliced kernel has no half
+    // instances) and take the sq/coop int8 path instead.
     if (mul1 && !half_k && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() && bszm_in == 1 &&
         min_index < 0 && !indices && !weights && num_tokens == 1 &&
         force_shape_idx <= 0 && force_num_sms <= 0)

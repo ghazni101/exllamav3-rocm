@@ -40,13 +40,24 @@ Verified on gfx1100 (2026-10-03): half-rate `exl3_gemm` agrees with a
 RMS for K = 1.5 / 2.5 / 3.5 (same as the integer rates), and `quantize_tiles_frac`
 reproduces the expected rate/error curve (tile MSE 0.053 / 0.014 / 0.0034).
 
-**Limitation — the int8-activation GEMV path does not implement half rates.** On
-ROCm the port's fast decode path is fused int8 GEMV (`EXL3_INT8_GEMV=1`, including
-the `msq` sliced variant). Its kernels are integer-rate only here, so `exl3_gemm`
-keeps mul1 tensors at half-integer bitrates on the fp16 GEMM path instead
-(`!half_k` guards on the int8/msq calls in `exl3_gemm.cu`), which does carry the
-half-rate instances. A half-rate model therefore foregoes the int8-GEMV decode
-acceleration; integer-rate models are unaffected.
+**The int8-activation GEMV path carries half rates.** On ROCm the port's fast decode
+path is fused int8 GEMV (`EXL3_INT8_GEMV`, default 2). Its `sq` and `coop` kernels are
+now templated on `HALF` as well (`exl3_gemv_int8_kernel.cuh`: the two-group extraction of
+`dq8_half`, `gemv_int8_twords<bits,HALF>` = `16 * K + 8` uint16 per tile, `ext8w_half`),
+with dedicated `_h1/_h2/_h3` instances for 1.5 / 2.5 / 3.5 bpw selected inside
+`exl3_gemv_int8.cu`. The port's `sq` grid-multiplier / slice-height tuning and the `msq`
+sliced variant are kept; `msq` has no half instances, so half-rate tensors take the
+`sq`/`coop` path.
+
+Measured on gfx1100 (2026-10-03, OrcaSAQ-2-27B-EXL3-3.21bpw — 409 tensors, 120 of them
+at 3.5 bpw, Q8 KV):
+
+- decode 128 tokens greedy: **8.5 → 34.8 tok/s** with the half-rate int8 path in place
+  (1.7 tok/s with `EXL3_INT8_GEMV=0`, i.e. the fp16 path only — the int8 GEMV is the
+  whole ballgame on this port);
+- int8 half-rate output vs the fp16 reconstruct reference: ~0.8% relative RMS for
+  K = 1.5 / 2.5 / 3.5 at m = 1 / 2 / 4 — the same deviation as the integer rates
+  (0.12% with the int8 path off).
 
 Dev-only kernels that do not hipify are intentionally not part of this branch
 (`dflash2`, `det_gemm`/`hc_mix_tiled`/`routing_gemm`); the corresponding

@@ -78,8 +78,18 @@ static std::map<std::pair<void*, size_t>, int> gemv_occ_cache[MAX_DEVICES];
 typedef void (*gemv_int8_coop_fn)
     (const half*, const uint16_t*, void*, int, int, int, int*, const half*, half*, const half*);
 
-static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
+static void* select_gemv_int8_kernel(int K, bool half_k, bool c_fp32, bool residual)
 {
+    if (half_k)
+    {
+        switch (K)
+        {
+            case 1: return exl3_gemv_int8_coop_sel_h1(c_fp32, residual);
+            case 2: return exl3_gemv_int8_coop_sel_h2(c_fp32, residual);
+            case 3: return exl3_gemv_int8_coop_sel_h3(c_fp32, residual);
+        }
+        return nullptr;
+    }
     switch (K)
     {
         case 1: return exl3_gemv_int8_coop_sel_k1(c_fp32, residual);
@@ -96,8 +106,18 @@ static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
 
 
 
-static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual)
+static void* select_gemv_int8_sq_kernel(int K, bool half_k, int M, bool c_fp32, bool residual)
 {
+    if (half_k)
+    {
+        switch (K)
+        {
+            case 1: return exl3_gemv_int8_sq_sel_h1(M, c_fp32, residual);
+            case 2: return exl3_gemv_int8_sq_sel_h2(M, c_fp32, residual);
+            case 3: return exl3_gemv_int8_sq_sel_h3(M, c_fp32, residual);
+        }
+        return nullptr;
+    }
     switch (K)
     {
         case 1: return exl3_gemv_int8_sq_sel_k1(M, c_fp32, residual);
@@ -124,6 +144,15 @@ static void* select_gemv_int8_msq_kernel(int K, bool c_fp32, bool residual)
         case 8: return exl3_gemv_int8_msq_sel_k8(c_fp32, residual);
     }
     return nullptr;
+}
+
+// Stage-region bytes for the smem-staged unit: host mirror of the kernel's sh_b layout. ROCm routes
+// every K to the narrow unit, so this is 0 there (see gemv_int8_stage_smem).
+static size_t gemv_int8_stage_bytes_for(int K, bool half_k)
+{
+    if (!gemv_int8_stage_smem(K, half_k)) return 0;
+    const int per_warp_row = half_k ? 8 * (2 * K + 1) : 16 * K;   // uint32 per pair row per warp
+    return (size_t) 8 * GEMV_STAGE_D * per_warp_row * 4;
 }
 
 // Fixed-size per-device workspace shared by the sq and coop paths, allocated once and never
@@ -210,14 +239,14 @@ static void sq_launch_log(const char* tag, int grid, int maxb, int num_sms,
 static bool exl3_gemv_int8_sq
 (
     const half* A_ptr, const uint16_t* B_ptr, void* C_ptr,
-    int size_m, int size_k, int size_n, int K, bool c_fp32, bool residual,
+    int size_m, int size_k, int size_n, int K, bool half_k, bool c_fp32, bool residual,
     const half* suh_ptr, half* A_had_ptr, const half* svh_ptr,
     int device, int num_sms, cudaStream_t stream, Graph* graph
 )
 {
     if (size_m > 4) return false;
     int M = size_m > 2 ? 4 : size_m;
-    void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
+    void* fn = select_gemv_int8_sq_kernel(K, half_k, M, c_fp32, residual);
     if (!fn) return false;
 
     int rows_max = gemv_int8_sq_rows_max(M, residual);
@@ -250,7 +279,7 @@ static bool exl3_gemv_int8_sq
     };
     auto smem_for = [&] (int rows_per) -> size_t
     {
-        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        size_t stage = gemv_int8_stage_bytes_for(K, half_k);
         return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
                + stage + (size_t) 2 * M * 128 * 4;
     };
@@ -514,7 +543,11 @@ bool exl3_gemv_int8
 {
     if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
 
-    int K = B.size(2) / 16;
+    // Tile width: 16 * K uint16 per 256-weight tile, 16 * K + 8 at the half-integer rates
+    // (K + 0.5, mul1 codebook only; the caller gates the codebook)
+    const int tile_u16 = (int) B.size(2);
+    const int K = tile_u16 / 16;
+    const bool half_k = (tile_u16 % 16) != 0;
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
     int size_m = A.numel() / size_k;
@@ -533,13 +566,13 @@ bool exl3_gemv_int8
     // the gate go straight to the regular kernel.
     if (size_m <= (residual ? 1 : 4) && exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
-        size_m, size_k, size_n, K, c_fp32, residual,
+        size_m, size_k, size_n, K, half_k, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
         device, num_sms, stream, graph))
         return true;
     if (size_m > 1) return false;
 
-    void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
+    void* fn = select_gemv_int8_kernel(K, half_k, c_fp32, residual);
     if (!fn) return false;
 
     // Mirror the kernel's work decomposition for the shared memory size; grid = max co-resident
@@ -553,7 +586,7 @@ bool exl3_gemv_int8
         ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
         ksplit = MIN(ksplit, rows_total);
         int rows_per = CEIL_DIVIDE(rows_total, ksplit);
-        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        size_t stage = gemv_int8_stage_bytes_for(K, half_k);
         return MAX((size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage, (size_t) 8 * 128 * 4);
     };
 

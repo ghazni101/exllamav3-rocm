@@ -1,0 +1,15 @@
+Processing /src
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: exllamav3
+  Building wheel for exllamav3 (pyproject.toml): started
+  Building wheel for exllamav3 (pyproject.toml): finished with status 'done'
+  Created wheel for exllamav3: filename=exllamav3-1.5.3-cp312-cp312-linux_x86_64.whl size=64925540 sha256=7c59e3fe18d7b415fa750966359a3e8454f7b1b1169ed1b1329ca6bafb558299
+  Stored in directory: /tmp/pip-ephem-wheel-cache-neg0sy3t/wheels/be/16/c1/367c544384017c548a18cd5b8ec9d158b60362a7ae1a22dff3
+Successfully built exllamav3
+Installing collected packages: exllamav3
+  Attempting uninstall: exllamav3
+    Found existing installation: exllamav3 1.5.3
+    Uninstalling exllamav3-1.5.3:
+      Successfully uninstalled exllamav3-1.5.3
+Successfully installed exllamav3-1.5.3
