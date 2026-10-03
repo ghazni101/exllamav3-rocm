@@ -37,7 +37,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
         (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
 
         A_ += 16 * size_k;
@@ -232,7 +232,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
                 (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
@@ -340,27 +340,4 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
     }
-}
-
-// Instance-table helpers: return the kernel pointer, or nullptr when the configuration's
-// shared memory footprint exceeds SMEM_MAX. On ROCm (64 KB opt-in limit) this excludes the
-// 16x16x512 shape at bits = 8; on CUDA every shape fits. The discarded branch of
-// if constexpr is not instantiated, so oversized configurations never reach the
-// static_assert in exl3_gemm_kernel_inner.
-template<EXL3_GEMM_T_ARGS>
-inline fp_exl3_gemm_kernel exl3_gemm_kernel_or_null()
-{
-    if constexpr (exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, true) <= SMEM_MAX)
-        return &exl3_gemm_kernel<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>;
-    else
-        return nullptr;
-}
-
-template<EXL3_GEMM_T_ARGS>
-inline fp_exl3_mgemm_kernel exl3_mgemm_kernel_or_null()
-{
-    if constexpr (exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, false) <= SMEM_MAX)
-        return &exl3_mgemm_kernel<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>;
-    else
-        return nullptr;
 }

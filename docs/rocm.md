@@ -26,6 +26,32 @@ Scope: gfx110x (RDNA3). Only wave32 parts are supported — `arch_list.py` /
   paths) — pageable copies serialize the stream and stall the host ~10 ms per
   chunk boundary.
 
+## Fractional (half-integer) trellis bitrates
+
+`port/rocm-frac-trellis` merges upstream dev's fractional-trellis support
+(half-integer bitrates `K = N + 0.5`, `mul1` codebook only: positions alternate
+N / N+1-bit steps) onto the port. Dedicated instances exist for **1.5 / 2.5 / 3.5
+bpw** (`exl3_comp_unit_h{,1..3}.cu`, `quantize_tiles_frac_inst.cu`,
+`exl3_gemv_half_inst.cu`, `exl3_moe{,_coop}_inst_h{,1..3}*.cu`); other half rates
+raise the extension's explicit "No kernel for half-integer GEMM bitrate" check.
+
+Verified on gfx1100 (2026-10-03): half-rate `exl3_gemm` agrees with a
+`reconstruct_had_slice`-based dequantize-then-matmul reference at ~1.2e-3 relative
+RMS for K = 1.5 / 2.5 / 3.5 (same as the integer rates), and `quantize_tiles_frac`
+reproduces the expected rate/error curve (tile MSE 0.053 / 0.014 / 0.0034).
+
+**Limitation — the int8-activation GEMV path does not implement half rates.** On
+ROCm the port's fast decode path is fused int8 GEMV (`EXL3_INT8_GEMV=1`, including
+the `msq` sliced variant). Its kernels are integer-rate only here, so `exl3_gemm`
+keeps mul1 tensors at half-integer bitrates on the fp16 GEMM path instead
+(`!half_k` guards on the int8/msq calls in `exl3_gemm.cu`), which does carry the
+half-rate instances. A half-rate model therefore foregoes the int8-GEMV decode
+acceleration; integer-rate models are unaffected.
+
+Dev-only kernels that do not hipify are intentionally not part of this branch
+(`dflash2`, `det_gemm`/`hc_mix_tiled`/`routing_gemm`); the corresponding
+architectures/bindings are not registered.
+
 ## Performance changes (all measured on gfx1100, Qwen3.8-27B-EXL3-3.5bpw)
 
 Decode baseline → final: ~22 → ~41.7 tok/s (4096 ctx / 256 gen, greedy).
@@ -78,8 +104,15 @@ but not gated - two coherent continuations drift in and out of coincidental
 token agreement; the numeric gap itself is numcheck's job.
 `GATE_BATCH_STRICT=1` restores
 exact equality for A/B runs whose numerics should be batch-independent.
-Within a dispatch family the output *is* bitwise batch-independent (verified
-m=5..2048 on model tensors).
+Within a dispatch family, outputs are batch-size *tolerant*, not bitwise
+identical (measured 2026-10-03, qwen38-27b 4.0bpw build git-584dd44f: the
+int8 family's lm_head row output differs between the m=1/2 and m=3/4
+sub-paths by up to 0.02 abs — consistent with sub-path quantization
+granularity — and the fp16 reconstruct family differs above m~512 by up to
+0.004 abs, the hipBLAS tiling changing with m; an earlier claim of bitwise
+batch-independence for m=5..2048 did not reproduce). Same-m reruns are
+bitwise deterministic. `fuzz_exl3_adversarial.py`'s per-family row
+consistency check (0.05) is the enforcement of this tolerance.
 
 Prefill numerics additionally differ from exact fp32 GEMM output when
 `EXL3_HGEMM_F16OUT=1` (default on ROCm): each fp32-output reconstruct GEMM
@@ -116,19 +149,29 @@ and prefill exits for detection in CI or a server until this is pinned. If it
 reproduces, capture triton-rocm version + the canary message and file upstream
 against triton-rocm.
 
-### Defense-in-depth: bounded paged indexing (2026-10-02)
+### Bounded paged indexing — NOT on this branch (verified 2026-10-03)
 
-Every paged cache kernel that derives addresses from `block_table` /
-`cache_seqlens` now bounds-checks first: torn staging produces a skipped/clamped
-access instead of a wild VRAM write or read. Covers `quant_cache_paged_kernel`,
-`dequant_cache_paged_kernel` (+ window variant), `dspark_write_rows_kernel`,
-`paged_kv_update_vec8_kernel`, `kv_cache_update_kernel_paged` and the
-chunked-paged attention kernels (`paged_cache_offset` clamps both index levels),
-in both the CUDA and HIP sources; on the Triton side `_paged_kv_update_kernel`
-masks its store and the decode/prefill attention kernels clamp `phys` and
-`total_k_len` against the pool/table extents. A corrupted index now yields wrong
-but bounded output — tripped by `EXL3_ATTN_CANARY` — rather than silent cache or
-weight corruption.
+The kernel-side bounds guards (`num_cache_pages` plumbing + `phys` clamps in the
+C++/HIP paged kernels, the masked `_paged_kv_update_kernel` store and the
+decode/prefill `phys`/`total_k_len` clamps in `triton_paged.py`) live on the
+`port/upstream-paged-bounds` branch (PR in preparation) and are **not merged
+into `port/rocm`**. An earlier revision of this section described them as
+present here; that was wrong.
+
+Verified empirically on this branch's build (image git-584dd44f,
+`repro_436_portable.py` from `issue-436-repro` at 526e94b0, provenance-asserted
+against the image's own `triton_paged.py`):
+
+- an unmasked store through a `block_table` entry of `pool+2` lands exactly two
+  pages past the cache pool (3/3 repeats, sentinel guard region);
+- attention reads through garbage `phys` values (2^20 .. 2^31-1, -1) complete
+  silently with finite output;
+- a torn pinned staging upload still makes attention launched with table A
+  return table B's output exactly (3/3 repeats, silent).
+
+Until that PR merges, `EXL3_ATTN_CANARY` remains the only tripwire on this
+branch, and the upload-ordering rule in `util/tensor.py` ("must not refill them
+until a sync point") is the only guard against the staging tear.
 
 ## Testing
 

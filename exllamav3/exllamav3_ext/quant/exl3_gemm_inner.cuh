@@ -4,16 +4,11 @@
 
 // Constants
 #define EXL3_GEMM_BASE_THREADS 256
-#if defined(USE_ROCM)
-// 64 KB is the dynamic shared memory opt-in limit on both RDNA (gfx10/11/12) and CDNA
-// (gfx9) parts. Kernel configurations whose footprint exceeds it are not instantiated
-// on ROCm (see exl3_kernel_map.cuh).
-#define SMEM_MAX (64 * 1024)
-#else
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
-#endif
 
 #include "exl3_dq.cuh"
+// For exl3_gemm_smem_bytes(), the shared definition of this kernel's shared memory footprint
+#include "exl3_kernel_map.cuh"
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
@@ -25,33 +20,6 @@
 #else
     #define EXL3_GEMM_H_ACC 0
 #endif
-
-// Dynamic shared memory footprint of one kernel configuration, in bytes. Host-callable so
-// the instance tables and shape selection can reject configurations that exceed SMEM_MAX
-// (matters on ROCm, where the opt-in limit is 64 KB).
-constexpr int exl3_gemm_smem_bytes
-(
-    int bits,
-    int TILESIZE_M,
-    int TILESIZE_K,
-    int TILESIZE_N,
-    int SH_STAGES,
-    bool shmem_out_had
-)
-{
-    const int TILEBLOCKS_K = TILESIZE_K / 16;
-    const int TILEBLOCKS_N = TILESIZE_N / 16;
-    const int TILEBLOCKS_M = TILESIZE_M / 16;
-    const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
-    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                          // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;    // in uint16s
-    const int sh_c_size = MAX  // in floats
-    (
-        4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
-        shmem_out_had ? TILESIZE_N * TILESIZE_M : 0
-    );
-    return SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
-}
 
 // TILESIZE_M == 16 is the dense / decode shape: one m16 row fragment, A fragments double-buffered
 // across the fragment stages (codegen unchanged by the multi-row support below). TILESIZE_M > 16
@@ -83,8 +51,9 @@ void exl3_gemm_kernel_inner
     // const int FRAGS_M = TILEBLOCKS_M;
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
+    constexpr int TILE_U16 = 16 * bits + (half_k ? 8 : 0);                        // uint16 per 16x16 tile
     const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;   // in uint16s
     const int sh_c_size = MAX  // in floats
     (
         4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
@@ -104,8 +73,18 @@ void exl3_gemm_kernel_inner
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
     (
-        SMEM_MAX >= exl3_gemm_smem_bytes(bits, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, shmem_out_had),
+        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
         "Invalid kernel params (insufficient shared memory for shape)"
+    );
+    // The host filters shapes by asking exl3_gemm_smem_bytes() what this layout costs; if that
+    // function and the layout above ever diverge, the filter would vet a footprint the kernel
+    // does not actually have. Assert they agree, per instantiation, at compile time.
+    static_assert
+    (
+        exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
+                             bits, half_k, shmem_out_had)
+            == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout"
     );
 
     // Shared memory
@@ -168,9 +147,9 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
-    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
-    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * TILE_U16;
+    const int gl_b_stride_n = TILEBLOCKS_N * TILE_U16;
+    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
@@ -181,7 +160,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_full * TILE_U16 / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -330,12 +309,10 @@ void exl3_gemm_kernel_inner
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
-        // Zero out A fragment elements for rows >= size_m. On ROCm, the MMA
-        // emulation uses __shfl_sync to gather across all 32 lanes, so
-        // uninitialized rows (>= size_m) in shared memory can contain NaN bit
-        // patterns that propagate to valid output rows via the shuffle.
-        // On NVIDIA the hardware MMA reads each lane's fragment independently,
-        // so this contamination doesn't occur.
+        // Zero out A fragment elements for rows >= size_m. On ROCm, the MMA emulation uses
+        // __shfl_sync to gather across all 32 lanes, so uninitialized rows (>= size_m) in shared
+        // memory can contain NaN bit patterns that propagate to valid output rows via the shuffle.
+        // On NVIDIA the hardware MMA reads each lane's fragment independently, so this cannot occur.
         #if defined(USE_ROCM)
         {
             int g = lane_id / 4;
@@ -361,14 +338,15 @@ void exl3_gemm_kernel_inner
         }
         #endif
 
+
         // B fragments
         #pragma unroll
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * TILE_U16);
 
-            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+            dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
         __syncthreads();
@@ -950,12 +928,12 @@ void exl3_gemm_kernel_inner
         if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
-            for (int n = 0; n < FRAGS_N_PER_WARP; n += 2)
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
                 #if EXL3_GEMM_H_ACC
-                    ptx_mma_m16n16k16(frag_a[buf], frag_b[buf][n], frag_b[buf][n+1], frag_c_h[0][n], frag_c_h[0][n+1]);
+                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[0][n]);
                 #else
-                    ptx_mma_m16n16k16(frag_a[buf], frag_b[buf][n], frag_b[buf][n+1], frag_c[0][n], frag_c[0][n+1]);
+                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[0][n]);
                 #endif
             }
         }
@@ -964,12 +942,12 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
                 #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; n += 2)
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
                     #if EXL3_GEMM_H_ACC
-                        ptx_mma_m16n16k16(frag_a[m], frag_b[buf][n], frag_b[buf][n+1], frag_c_h[m][n], frag_c_h[m][n+1]);
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
                     #else
-                        ptx_mma_m16n16k16(frag_a[m], frag_b[buf][n], frag_b[buf][n+1], frag_c[m][n], frag_c[m][n+1]);
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
                     #endif
                 }
         }

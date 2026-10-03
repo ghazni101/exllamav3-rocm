@@ -24,6 +24,7 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
+#include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
@@ -137,10 +138,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
+    m.def("quantize_tiles_frac", &quantize_tiles_frac, "quantize_tiles_frac");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
+    m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
@@ -152,9 +156,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
-    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
+          py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");

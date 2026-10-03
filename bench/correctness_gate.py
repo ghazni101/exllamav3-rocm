@@ -37,6 +37,17 @@ Modes:
 
 Greedy decoding is deterministic: any numeric change (grid size, reduction order,
 tiling) shows up as divergent token ids long before it is visible as loss.
+
+Startup-fragility caveat (measured 2026-10-03): baseline/compare token identity
+holds only for a byte-identical process startup. ANY perturbation that changes
+import-time conditions — replacing a module in site-packages, or merely
+`touch`ing one .py (bytecode recompilation) — reproducibly shifts the GEMM
+autotuner's first-use timing and with it the winning config, flipping near-tie
+tokens mid-generation (observed: 2/8 prompts forking at generated tokens 18/26,
+identically for a comment-only change and for touch-only). Save baselines and
+run compares from the same unmodified image; attribute cross-startup forks to
+the autotuner before suspecting the code change, and confirm with numcheck's
+KLD (a config-order flip is rounding-scale; a real bug is not).
 """
 import os, sys, json, time
 import torch
@@ -233,11 +244,25 @@ def main():
         path = sys.argv[3]
         tokens, logits = run_numcheck()
         if sub == "save":
-            torch.save({"tokens": tokens, "logits": logits}, path)
-            print(f"[gate] numcheck reference written to {path}")
+            torch.save({"tokens": tokens, "logits": logits,
+                        "meta": {"model": MODEL_DIR, "prompts": sorted(logits),
+                                 "steps": NUMCHECK_STEPS, "long": NUMCHECK_LONG}}, path)
+            print(f"[gate] numcheck reference written to {path} ({len(logits)} prompts)")
         else:
             ref = torch.load(path, weights_only=False)
             rt, rl = ref["tokens"], ref["logits"]
+            rmeta = ref.get("meta", {})
+            # Reference integrity: a stale or foreign reference must not silently
+            # shrink the compared set to whatever overlaps. Compare against a
+            # different model or prompt set needs a fresh save.
+            if rmeta.get("model") not in (None, MODEL_DIR):
+                print(f"[gate] NUMCHECK FAIL: reference was saved for {rmeta['model']}, running {MODEL_DIR}")
+                sys.exit(1)
+            missing = [n for n in rl if n not in logits]
+            if missing:
+                print(f"[gate] NUMCHECK FAIL: prompts in reference missing this run: {missing} "
+                      f"(regression in logits plumbing, or a stale reference - resave)")
+                sys.exit(1)
             worst = 0.0
             bad = []
             if len(logits) < 3:
@@ -319,7 +344,12 @@ def main():
             return (div[0], len(div), runs)
 
         bad = []
-        n_prompt = min(len(tok.encode(t, add_bos=True).flatten().tolist()) for t in ptexts)
+        # Per-prompt length: sequences include the prompt, so the earliest possible
+        # fork index for prompt n is its own prompt length. Subtracting the MINIMUM
+        # length instead (as this once did) inflates first_gen for every longer
+        # prompt by (len_i - min_len) and lets a generated-token-0 fork pass the
+        # GATE_BATCH_MINSTEP check for all but the shortest prompt.
+        prompt_len = {n: ids.shape[1] for n, ids in zip(names, pids)}
         for n in names:
             a, b = seq[n], conc[n]
             if len(a) != len(b):
@@ -331,7 +361,7 @@ def main():
                 print(f"[gate] {n}: token-identical ({len(a)} tokens)")
                 continue
             first, ndiv, runs = rep
-            first_gen = first - n_prompt  # position among GENERATED tokens
+            first_gen = first - prompt_len[n]  # position among GENERATED tokens
             print(f"[gate] {n}: fork at generated-token {first_gen} "
                   f"({ndiv} divergent tokens in {runs} divergence stretch(es); "
                   f"stretches after the first fork include coincidental agreement)")

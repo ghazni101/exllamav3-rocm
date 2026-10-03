@@ -80,6 +80,48 @@ r2 = torch.empty(64, 512, device=DEV, dtype=torch.float32); ext.hgemm(a, b, r2)
 check(bool((r1 == r2).all()), "hgemm nondeterministic")
 print("determinism: ok")
 
+# f16acc batched determinism (plain hgemm determinism above covers only the 2-D path)
+a3 = torch.randn(3, 64, 512, device=DEV, dtype=torch.half) * 0.25
+b3 = torch.randn(3, 512, 512, device=DEV, dtype=torch.half) * 0.25
+c3a = torch.empty(3, 64, 512, device=DEV, dtype=torch.half)
+c3b = torch.empty(3, 64, 512, device=DEV, dtype=torch.half)
+ext.hgemm_f16acc(a3, b3, c3a)
+ext.hgemm_f16acc(a3, b3, c3b)
+check(bool((c3a == c3b).all()), "hgemm_f16acc nondeterministic")
+print("f16acc determinism: ok")
+
+# Adversarial values: NaN / Inf / overflow-boundary elements, each poisoning exactly
+# one row of one batch element. Policies under test:
+#  - NaN/Inf must propagate to that row's output (never silently replaced by finite data)
+#  - an 8000-magnitude element (fp16-acc overflow boundary) may saturate to Inf but must
+#    not collapse toward zero and must not corrupt any other row
+M, N, K, B = 17, 128, 512, 3
+for tag, poison in [("nan", float("nan")), ("inf", float("inf")), ("overflow", 8000.0)]:
+    av = torch.randn(B, M, K, device=DEV, dtype=torch.half) * 0.25
+    bv = torch.randn(B, K, N, device=DEV, dtype=torch.half) * 0.25
+    av[0, 0, 0] = poison
+    ref = av.double() @ bv.double()
+    cv = torch.empty(B, M, N, device=DEV, dtype=torch.half)
+    ext.hgemm_f16acc(av, bv, cv)
+    # every unpoisoned row (all of batch 1..B-1 plus rows 1..M-1 of batch 0) must be
+    # finite and match the reference: poison must not leak across rows
+    unpois = cv.clone(); unpois[0, 0] = 0.0
+    ref_u = ref.clone(); ref_u[0, 0] = 0.0
+    check(bool(torch.isfinite(unpois).all()), f"{tag}: unpoisoned rows non-finite (cross-row corruption)")
+    e_u = rel_rms(unpois, ref_u)
+    check(e_u < 0.01, f"{tag}: unpoisoned rows rel {e_u:.4f}")
+    row = cv[0, 0]
+    ref_row_abs = ref[0, 0].abs().max()
+    if tag == "overflow":
+        # only outputs paired with a large b[0,j] are large; the row's MAX must
+        # carry the poison (saturating to Inf is also acceptable for fp16 acc)
+        big = bool((~torch.isfinite(row)).any()) or float(row.abs().max()) >= 100.0
+        check(big, f"{tag}: poisoned row collapsed (max |out| {row.abs().max():.1f} vs ref {ref_row_abs:.0f})")
+    else:
+        check(bool((~torch.isfinite(row)).all()), f"{tag}: poisoned row silently finite")
+    print(f"  {tag}: unpoisoned rel {e_u:.4f}, poisoned row "
+          f"{'non-finite' if not bool(torch.isfinite(row).all()) else 'finite'}", flush=True)
+
 if failures:
     print(f"\n{len(failures)} FAILURES")
     sys.exit(1)

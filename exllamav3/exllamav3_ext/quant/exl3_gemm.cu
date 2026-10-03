@@ -9,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
+#include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
@@ -60,7 +61,8 @@ uint64_t gemm_autotune_hash
     int device,
     int cc,
     int max_num_sms,
-    int cb
+    int cb,
+    bool half_k
 )
 {
     uint64_t h = 1469598103934665603ull;
@@ -69,6 +71,7 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
+    mix((uint64_t) (half_k ? 1 : 0));
     mix((uint64_t) MIN(roundup_pow2(size_m), 16));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
@@ -93,10 +96,11 @@ uint64_t mgemm_autotune_hash
     int max_num_sms,
     int cb,
     int bszm_in,
-    int bszm_out
+    int bszm_out,
+    bool half_k
 )
 {
-    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb);
+    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb, half_k);
     auto mix = [&] (uint64_t v)
     {
         h ^= v;
@@ -162,9 +166,15 @@ int exl3_gemm_gr
     // msq path instead (tg-1b); do not extend the coop grid without shrinking the
     // block footprint first.
     int* locks = DevCtx::instance().get_locks(device);
+    // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
+    // request would fail the launch there. Ask for what this device actually permits.
+    int smem_max = DevCtx::instance().get_smem_request(device);
 
-    // Dispatch
-    int K = B.size(2) / 16;
+    // Dispatch. 16 * K uint16 per tile for integer K; half-integer bitrates (K + 0.5, mul1 only) carry 16 * K + 8
+    const int tile_u16 = B.size(2);
+    const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
+    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemm: half-integer bitrates require the mul1 codebook");
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
@@ -184,8 +194,9 @@ int exl3_gemm_gr
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
-    // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    // to the regular kernel. Half-integer bitrates (16 * K + 8 uint16 per tile) are not supported by
+    // this path on ROCm and take the fp16 GEMM below, which carries the half-rate instances.
+    if (mul1 && !half_k && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, force_num_sms, stream, graph))
             return 0;
@@ -230,7 +241,7 @@ int exl3_gemm_gr
         void* gemv_kernel = nullptr;
         if (exl3_gemv_try_launch
         (
-            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
+            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
             suh_ptr && A_had_ptr && svh_ptr,
             device, stream, &gemv_kernel, false
         ))
@@ -247,9 +258,9 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
+        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
         CoopAutotuneLaunch tuned;
-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
@@ -258,9 +269,9 @@ int exl3_gemm_gr
         std::vector<CoopAutotuneCandidate> candidates;
         for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
         {
-            if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
+            if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
 
-            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
+            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -280,7 +291,7 @@ int exl3_gemm_gr
         }
         TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
 
-        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n);
+        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, smem_max, stream, (size_t) size_k * size_n);
         if (graph)
         add_graph_args((void*) tuned.kernel);
         cuda_check(cudaPeekAtLastError());
@@ -291,7 +302,7 @@ int exl3_gemm_gr
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &shape_idx,
-        &num_sms, cb
+        &num_sms, cb, half_k
     );
     if (!kernel) return 0;
 
@@ -310,7 +321,7 @@ int exl3_gemm_gr
         num_sms,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_max,
         stream
     );
     add_graph_args((void*) kernel);
@@ -404,7 +415,7 @@ int exl3_mgemm_gr
     const at::Tensor& svh,
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
-    int K,
+    float K_,
     int force_shape_idx,
     bool mcg,
     bool mul1,
@@ -522,6 +533,7 @@ int exl3_mgemm_gr
     int device;
     cudaGetDevice(&device);
     int total_sms = DevCtx::instance().get_num_sms(device);
+    int smem_max = DevCtx::instance().get_smem_request(device);
     int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
@@ -534,17 +546,21 @@ int exl3_mgemm_gr
     const uintptr_t* suh_ptr_ptr = (const uintptr_t*) suh.data_ptr();
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
 
-    // Select kernel
+    // Select kernel. K_ is the bitrate (integer or half-integer, see bits_k.cuh)
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    const bool half_k = bk.half;
+    TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
 
     // Multi-matrix/sliced fast path: one regular launch covers the whole call (sliced
     // SlicedMultiLinear bundles and plain multi-matrix projections), any m - rows are flattened
     // into the unit index. No filtering/reduction; MoE-style per-matrix inputs (bszm_in > 1)
     // stay on the coop kernel.
-    if (mul1 && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() && bszm_in == 1 &&
+    if (mul1 && !half_k && exl3_gemv_int8_enabled() && exl3_gemv_int8_msq_enabled() && bszm_in == 1 &&
         min_index < 0 && !indices && !weights && num_tokens == 1 &&
         force_shape_idx <= 0 && force_num_sms <= 0)
     {
@@ -606,12 +622,12 @@ int exl3_mgemm_gr
     {
         uint64_t autotune_key = mgemm_autotune_hash
         (
-            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out
+            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
         );
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
         CoopAutotuneLaunch tuned;
-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
@@ -622,9 +638,9 @@ int exl3_mgemm_gr
             std::vector<CoopAutotuneCandidate> candidates;
             for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
             {
-                if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
+                if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
 
-                fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
+                fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
                 if (!candidate_kernel) continue;
 
                 int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -644,7 +660,7 @@ int exl3_mgemm_gr
             }
             TORCH_CHECK(!candidates.empty(), "exl3_mgemm autotune: no compatible kernel shapes");
 
-            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n * bszm);
+            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, smem_max, stream, (size_t) size_k * size_n * bszm);
             add_graph_args((void*) tuned.kernel);
 
             // DBGI10(size_m, size_k, size_n, K, bszm_in, bszm_out, tuned.tag, tuned.block_dim, tuned.num_sms, tuned.concurrency);
@@ -658,7 +674,7 @@ int exl3_mgemm_gr
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &shape_idx,
-        &num_sms, cb, bszm_in, bszm_out
+        &num_sms, cb, bszm_in, bszm_out, half_k
     );
     int tilesize_k = exl3_gemm_tilesize_k_g[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n_g[shape_idx];
@@ -688,7 +704,7 @@ int exl3_mgemm_gr
         block_grid,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_max,
         stream
     );
     add_graph_args((void*) kernel);
@@ -707,7 +723,7 @@ int exl3_mgemm
     const at::Tensor& svh,
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
-    int K,
+    float K_,
     int force_shape_idx,
     uint32_t mcg_mult,
     uint32_t mul1_mult,
@@ -732,7 +748,7 @@ int exl3_mgemm
         svh,
         indices,
         weights,
-        K,
+        K_,
         force_shape_idx,
         mcg_mult,
         mul1_mult,

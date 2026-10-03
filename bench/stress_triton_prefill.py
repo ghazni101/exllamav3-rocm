@@ -11,10 +11,13 @@ against an fp32 torch reference, and additionally checks that each output differ
 previous call's output when inputs changed (catches stale-arg reuse that happens to be
 finite). Prints a compact PASS line per phase and full detail on any failure.
 """
-import sys, time, random, platform
+import sys, time, random, platform, os
 import torch
 
-sys.path.insert(0, "/opt/exllamav3")
+# Resolve the checkout this file lives in, not a hardcoded /opt path: run from a
+# dev box the hardcoded insert imported the installed package, so the script could
+# hammer a different (e.g. stale) copy than the tree it sits in.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.modules.attention_fn.triton_paged import (
     paged_attn_triton_decode, paged_attn_triton_prefill,
 )

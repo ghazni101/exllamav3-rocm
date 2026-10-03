@@ -266,6 +266,17 @@ class Sequence:
         #    is only safe because page hashing synchronizes with the GPU between
         #    generator steps. If a rebuild ever rewrites slots without such a
         #    sync, this needs event-guarding WITHOUT changing the address.
+        #
+        # 2026-10-03 review correction: (1) described the whole-step CUDA graph
+        # experiments, since removed (EXL3_STEP_GRAPH was measured and rejected;
+        # BC-attention capture is default-off on ROCm) - no graph in the current
+        # tree replays this memcpy; the historical divergence measurement was
+        # taken under those experiments. And the growth branch below DOES
+        # reallocate a new address (only the initial 64-page buffer is stable);
+        # what actually protects reuse today is the per-generator-step sync plus
+        # the caching allocator's stream-event recording on free. Pre-size this
+        # buffer to the sequence's page budget before ever relying on the fixed
+        # address again.
         n = len(self.allocated_pages)
         buf = self.__dict__.get("_block_index_pin")
         if buf is None or buf.shape[-1] < n:
