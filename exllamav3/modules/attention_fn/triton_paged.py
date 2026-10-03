@@ -1026,6 +1026,8 @@ def _paged_attn_decode_combine_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    ROWS_SUB: tl.constexpr,
+    D_SUB: tl.constexpr,
 ):
     """Flash-decoding phase 2: reduce the per-split partial accumulators. The output row is
     written V_DIM wide per head: with an asymmetric V head dim the padded lanes are dropped
@@ -1033,6 +1035,10 @@ def _paged_attn_decode_combine_kernel(
     the program's (BLOCK_ROWS, HD_PAD) tile into (ROWS_SUB, D_SUB) sub-tiles so the serial
     walk over the splits runs on many CTAs (decode launches only a few programs)."""
     pid = tl.program_id(0)
+    sub = tl.program_id(1)
+    D_CHUNKS: tl.constexpr = HD_PAD // D_SUB
+    r_c = sub // D_CHUNKS
+    d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
     h_blocks = tl.cdiv(group_size, BLOCK_H)
@@ -1041,38 +1047,48 @@ def _paged_attn_decode_combine_kernel(
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
-    rows = tl.arange(0, BLOCK_ROWS)
+    rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
     row_q = rows % BLOCK_M
     row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
     q_head = kv_head * group_size + row_h_local
     valid_row = (row_q < q_len) & (row_h_local < group_size)
 
-    offs_d = tl.arange(0, HD_PAD)
+    offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
     d_mask = offs_d < head_dim
 
-    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        m_max = tl.maximum(m_max, m_s)
+    # Splits are walked S_BLK at a time as one masked tile load per pass: a scalar loop with a
+    # runtime trip count and no pipelining serializes a full load latency per split (65 splits
+    # at a 2K sparse context cost 20 us), a tile load amortizes it
+    S_BLK: tl.constexpr = 16
+    offs_s = tl.arange(0, S_BLK)
+    m_max = tl.full((ROWS_SUB,), -float("inf"), tl.float32)
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        m_max = tl.maximum(m_max, tl.max(m_s, axis=0))
 
     if HAS_SINKS:
         # Learned per-head sink joins the softmax denominator at the final reduction
         sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
         m_max = tl.maximum(m_max, sink)
 
-    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, HD_PAD), tl.float32)
+    l_sum = tl.zeros((ROWS_SUB,), tl.float32)
+    acc = tl.zeros((ROWS_SUB, D_SUB), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
-        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
-        po_base = (pid * num_splits + s) * BLOCK_ROWS * HD_PAD
-        o_s = tl.load(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :])
-        acc += o_s * w[:, None]
-        l_sum += l_s * w
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        l_s = tl.load(partial_ml + ml_idx + 1, mask=s_mask[:, None], other=0.0)
+        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe[None, :]))
+        po_idx = (pid * num_splits + sidx)[:, None, None] * (BLOCK_ROWS * HD_PAD) \
+            + rows[None, :, None] * HD_PAD + offs_d[None, None, :]
+        o_s = tl.load(partial_o + po_idx, mask=s_mask[:, None, None], other=0.0)
+        acc += tl.sum(o_s * w[:, :, None], axis=0)
+        l_sum += tl.sum(l_s * w, axis=0)
 
     if HAS_SINKS:
         l_sum += tl.exp(sink - m_safe)
@@ -1083,38 +1099,19 @@ def _paged_attn_decode_combine_kernel(
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
 
 
+def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+    """(ROWS_SUB, D_SUB) for the combine kernel: the smallest sub-tile whose h32 rotation still
+    forms a >= 16-row tl.dot (ROWS_SUB * D_SUB >= 512), D_SUB a multiple of 32."""
+    d_sub = min(128, hd_pad)
+    rows_sub = min(block_rows, max(1, 512 // d_sub))
+    while rows_sub * d_sub < 512 and d_sub < hd_pad:
+        d_sub *= 2
+    if rows_sub * d_sub < 512:
+        rows_sub, d_sub = block_rows, hd_pad
+    return rows_sub, d_sub
+
+
 _decode_sm_count = {}
-
-# EXL3_ATTN_CANARY: 0 off (default), 1 warn once per process on degenerate output,
-# 2 also raise. Motivated by the 2026-10-01 review: one transient suite run produced
-# all-zero prefill output for every test in test_triton_paged_hdpad.py (rel err 1.0,
-# never reproduced in 6 later attempts). Softmax output is a convex combination of V
-# rows, so a whole all-zero output batch means the kernel computed against zeroed
-# inputs - the signature of a launcher/arg-staging race, not of bad math.
-_attn_canary = int(os.environ.get("EXL3_ATTN_CANARY", "0") or "0")
-_canary_warned = False
-
-def _attn_output_canary(tag: str, out: torch.Tensor, q: torch.Tensor):
-    global _canary_warned
-    if _attn_canary == 0:
-        return
-    # No full-tensor .float() copy: on the >2^31-offset overflow tests the output
-    # alone is ~8 GB and the copy OOMs the canary itself
-    if not bool(torch.isfinite(out).all()):
-        raise RuntimeError(f"paged_attn_{tag}: non-finite output "
-                           f"(q norm {q.float().norm():.3e})")
-    dead = (out.abs().amax(dim=tuple(range(1, out.ndim))) == 0)
-    if bool(dead.any()):
-        msg = (f"paged_attn_{tag}: {int(dead.sum())}/{dead.numel()} all-zero rows "
-               f"(q norm {q.float().norm():.3e})")
-        if _attn_canary >= 2:
-            raise RuntimeError(msg)
-        if not _canary_warned:
-            print(f"[attn-canary] WARNING: {msg}", flush=True)
-            _canary_warned = True
-
-
-
 
 def paged_attn_triton_decode(
     q: torch.Tensor,
@@ -1265,13 +1262,13 @@ def paged_attn_triton_decode(
         )
 
         if num_splits > 1:
-            _paged_attn_decode_combine_kernel[(programs,)](
+            rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
+            _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
                 num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
                 block_m, block_h, block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
-    _attn_output_canary("decode", out, q)
     return out
 
 
@@ -1885,7 +1882,7 @@ def paged_attn_triton_prefill(
     # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
     # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
-    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
+    blackwell = torch.version.hip is None and torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
         cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
     elif hd_pad <= 256:
@@ -2024,7 +2021,6 @@ def paged_attn_triton_prefill(
                 num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
                 num_warps=8, num_stages=1,
             )
-    _attn_output_canary("prefill", out, q)
     return out
 
 
