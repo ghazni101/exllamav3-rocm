@@ -54,7 +54,9 @@ at 3.5 bpw, Q8 KV):
 
 - decode 128 tokens greedy: **8.5 → 34.8 tok/s** with the half-rate int8 path in place
   (1.7 tok/s with `EXL3_INT8_GEMV=0`, i.e. the fp16 path only — the int8 GEMV is the
-  whole ballgame on this port);
+  whole ballgame on this port); at 3000-token context / 256 generated tokens it is
+  **40.6 tok/s** (prefill 554 tok/s), i.e. at parity with the earlier uniform-rate
+  incumbent's 41.3 tok/s;
 - int8 half-rate output vs the fp16 reconstruct reference: ~0.8% relative RMS for
   K = 1.5 / 2.5 / 3.5 at m = 1 / 2 / 4 — the same deviation as the integer rates
   (0.12% with the int8 path off).
