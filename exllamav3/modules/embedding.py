@@ -252,7 +252,17 @@ class Embedding(Module):
         # No indexed embeddings, or none in current batch
         else:
             if isinstance(self.embedding, TableEmbedding):
-                x = self.embedding.forward(x, bool(params.get("pinned_staging")))
+                # pinned_staging is a buffer-reuse request, NOT a sync guarantee
+                # (on master it only selects the pinned staging buffer; the port's
+                # prefill sets it precisely because chunks run back-to-back with
+                # no sync - see the resident-path comment below). RowTable.synced
+                # asserts the opposite ("caller guarantees a sync point before the
+                # next lookup"), and feeding pinned_staging into it disabled the
+                # pin-set event guard during prefill: with the uploads async, a
+                # reused staging set could be rewritten on the host before its
+                # H2D landed (torn table gather). lookup() must always record the
+                # event; the synchronize on reuse is free when a sync did happen.
+                x = self.embedding.forward(x, False)
             else:
                 x = self.embedding.forward(x)
             if self.multiplier != 1.0:
