@@ -106,13 +106,13 @@ upstream merge (first seen on the cac783b build). Characterization so far:
   prefill exit, confirming the wrapper returns wrong output rather than the
   tests mis-comparing. (The canary itself no longer materializes a float copy
   of the output — on the >2^31-offset overflow test that copy OOMs.)
-- Suspected, unproven: interference from a co-resident GPU process (this
-  machine runs a standing serve that parks/unparks around lock windows); lock
+- Suspected, unproven: interference from a co-resident GPU process (observed
+  while a standing inference server was parked on the same card); lock
   history shows no concurrent lock holder during failing runs, but the parked
-  serve's residency was not recorded per run.
+  server's residency was not recorded per run.
 
-`EXL3_ATTN_CANARY=1` (warn; serve default) / `2` (raise) instruments decode
-and prefill exits for detection in serve/CI until this is pinned. If it
+`EXL3_ATTN_CANARY=1` (warn) / `2` (raise) instruments decode
+and prefill exits for detection in CI or a server until this is pinned. If it
 reproduces, capture triton-rocm version + the canary message and file upstream
 against triton-rocm.
 

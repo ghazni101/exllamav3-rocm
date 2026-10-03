@@ -1,4 +1,4 @@
-# ROCm 10 build/serve image for exllamav3 on RDNA3 (gfx1100 / RX 7900 XTX).
+# ROCm 10 build/bench image for exllamav3 on RDNA3 (gfx1100 / RX 7900 XTX).
 #
 # Base: rocm-dev:10.0.0 ships a native ROCm 10.0 SDK under /opt/rocm (hipcc,
 # hipBLAS) and a venv at /opt/rocm-venv. Torch is the rocm7.14 wheel installed
@@ -60,6 +60,6 @@ ENV EXL3_CACHE_TOKENS=32768
 # prefills); 144 is the NVIDIA-tuned default and would put 17..144-row prefills on
 # the decode path (+0.5-1.5 s TTFT). Override to restore the upstream default.
 ENV EXL3_RECONSTRUCT_THRESHOLD=16
-ENV PORT=9001
-EXPOSE 9001
-CMD ["python3", "/opt/exllamav3/serve_rocm.py"]
+# Serving: run TabbyAPI (the official exllamav3 backend) inside this image or a
+# venv built from it; there is no bundled server entrypoint.
+CMD ["bash"]

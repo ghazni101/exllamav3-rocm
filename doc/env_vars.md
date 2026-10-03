@@ -183,14 +183,14 @@ variant ~5x slower, so this is on by default there (+60-73% on 2k-token prefill;
 fp16 rounding matches the precision the residual stream already carries). `0` restores the
 exact fp32-output path.
 
-### `EXL3_RECONSTRUCT_THRESHOLD` (default: `144`; serving sets `16`)
+### `EXL3_RECONSTRUCT_THRESHOLD` (default: `144`; the ROCm Dockerfile sets `16`)
 
 Row-count crossover between the int8 GEMV decode path and reconstruct+BLAS for EXL3
 projections. 144 is the NVIDIA-tuned default; on RDNA3 the GEMV path tops out around
-~56 tok/s while reconstruct is ~700 tok/s and the crossover is ~16 rows, so
-`serve_rocm.py`/`serve_openai.py` and the Dockerfile set `16` (before importing
-exllamav3; the value is read at import time) to keep chat-size prefills off the GEMV
-path. Set it explicitly to restore `144`.
+~56 tok/s while reconstruct is ~700 tok/s and the crossover is ~16 rows, so the
+ROCm image sets `16` (the value is read at import time; servers such as TabbyAPI
+must see it in their environment before importing exllamav3) to keep chat-size
+prefills off the GEMV path. Set it explicitly to restore `144`.
 
 ### `EXL3_GDN_CHUNK_MIN` (default: `8`), `EXL3_GDN_BC_MAX_QLEN` (default: `8`)
 
@@ -789,26 +789,10 @@ off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120;
 on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
 choice also sizes the quantizer's scratch buffers.
 
-### `EXL3_ATTN_CANARY` (default: `0`; serve sets `1`)
+
+### `EXL3_ATTN_CANARY` (default: `0`)
 
 Validate triton paged-attention output: `1` warns (once per process) when a call
 produces all-zero rows - the signature of the transient launcher race documented
 in docs/rocm.md - and always raises on non-finite output; `2` also raises on
-zero rows. Off by default because the check synchronizes; serving enables warn
-mode.
-
-### `EXL3_MAX_QUEUE` (default: `32`)
-
-Serving backpressure: reject `/generate` and `/v1/*` requests with 503 once this
-many jobs are pending+active, instead of queueing without bound (each queued job
-holds prompt tensors and pinning memory; active jobs hold cache pages).
-
-### `EXL3_REQUEST_TIMEOUT_S` (default: `600`)
-
-Serving: `/generate` fails with 503 and cancels the job if no result arrives
-within this many seconds. Belt-and-braces against a wedged driver.
-
-### `EXL3_WARMUP_OPTIONAL` (default: `0`)
-
-`warmup_openai.py` exits nonzero when the server never becomes healthy or an
-HTTP error occurs; set `1` to downgrade those to warnings.
+zero rows. Off by default because the check synchronizes.
